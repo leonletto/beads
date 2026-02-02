@@ -33,6 +33,22 @@ func parseNullableTimeString(ns sql.NullString) *time.Time {
 	return nil // Unparseable - shouldn't happen with valid data
 }
 
+// parseTimeString parses a time string from database TEXT columns (non-nullable).
+// Similar to parseNullableTimeString but for required timestamp fields like created_at/updated_at.
+// Returns zero time if parsing fails, which maintains backwards compatibility.
+func parseTimeString(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	// Try RFC3339Nano first (more precise), then RFC3339, then SQLite format
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{} // Unparseable - shouldn't happen with valid data
+}
+
 // parseJSONStringArray parses a JSON string array from database TEXT column.
 // Returns empty slice if the string is empty or invalid JSON.
 func parseJSONStringArray(s string) []string {
@@ -75,10 +91,14 @@ func formatJSONStringArray(arr []string) string {
 
 // CreateIssue creates a new issue
 func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {
-	// Fetch custom statuses for validation
+	// Fetch custom statuses and types for validation
 	customStatuses, err := s.GetCustomStatuses(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get custom statuses: %w", err)
+	}
+	customTypes, err := s.GetCustomTypes(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get custom types: %w", err)
 	}
 
 	// Set timestamps first so defensive fixes can use them
@@ -111,8 +131,8 @@ func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, act
 		issue.DeletedAt = &deletedAt
 	}
 
-	// Validate issue before creating (with custom status support)
-	if err := issue.ValidateWithCustomStatuses(customStatuses); err != nil {
+	// Validate issue before creating (with custom status and type support)
+	if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
@@ -138,8 +158,8 @@ func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, act
 	// We use raw Exec instead of BeginTx because database/sql doesn't support transaction
 	// modes in BeginTx, and modernc.org/sqlite's BeginTx always uses DEFERRED mode.
 	//
-	// Use retry logic with exponential backoff to handle SQLITE_BUSY under concurrent load
-	if err := beginImmediateWithRetry(ctx, conn, 5, 10*time.Millisecond); err != nil {
+	// The connection's busy_timeout pragma (30s) handles retries if locked.
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("failed to begin immediate transaction: %w", err)
 	}
 
@@ -163,10 +183,14 @@ func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, act
 		return fmt.Errorf("failed to get config: %w", err)
 	}
 
-	// Use IDPrefix override if set, combined with config prefix
-	// e.g., configPrefix="bd" + IDPrefix="wisp" → "bd-wisp"
+	// Determine prefix for ID generation and validation:
+	// 1. PrefixOverride completely replaces config prefix (for cross-rig creation)
+	// 2. IDPrefix appends to config prefix (e.g., "bd" + "wisp" → "bd-wisp")
+	// 3. Otherwise use config prefix as-is
 	prefix := configPrefix
-	if issue.IDPrefix != "" {
+	if issue.PrefixOverride != "" {
+		prefix = issue.PrefixOverride
+	} else if issue.IDPrefix != "" {
 		prefix = configPrefix + "-" + issue.IDPrefix
 	}
 
@@ -208,8 +232,44 @@ func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, act
 		}
 	}
 
-	// Insert issue
-	if err := insertIssue(ctx, conn, issue); err != nil {
+	// bd-0gm4r: Handle tombstone collision for explicit IDs
+	// If the user explicitly specifies an ID that matches an existing tombstone,
+	// delete the tombstone first so the new issue can be created.
+	// This enables re-creating issues after hard deletion (e.g., polecat respawn).
+	if issue.ID != "" {
+		var existingStatus string
+		err := conn.QueryRowContext(ctx, `SELECT status FROM issues WHERE id = ?`, issue.ID).Scan(&existingStatus)
+		if err == nil && existingStatus == string(types.StatusTombstone) {
+			// Delete the tombstone record to allow re-creation
+			// Also clean up related tables (events, labels, dependencies, comments, dirty_issues)
+			if _, err := conn.ExecContext(ctx, `DELETE FROM events WHERE issue_id = ?`, issue.ID); err != nil {
+				return fmt.Errorf("failed to delete tombstone events: %w", err)
+			}
+			if _, err := conn.ExecContext(ctx, `DELETE FROM labels WHERE issue_id = ?`, issue.ID); err != nil {
+				return fmt.Errorf("failed to delete tombstone labels: %w", err)
+			}
+			if _, err := conn.ExecContext(ctx, `DELETE FROM dependencies WHERE issue_id = ? OR depends_on_id = ?`, issue.ID, issue.ID); err != nil {
+				return fmt.Errorf("failed to delete tombstone dependencies: %w", err)
+			}
+			if _, err := conn.ExecContext(ctx, `DELETE FROM comments WHERE issue_id = ?`, issue.ID); err != nil {
+				return fmt.Errorf("failed to delete tombstone comments: %w", err)
+			}
+			if _, err := conn.ExecContext(ctx, `DELETE FROM dirty_issues WHERE issue_id = ?`, issue.ID); err != nil {
+				return fmt.Errorf("failed to delete tombstone dirty marker: %w", err)
+			}
+			if _, err := conn.ExecContext(ctx, `DELETE FROM issues WHERE id = ?`, issue.ID); err != nil {
+				return fmt.Errorf("failed to delete tombstone: %w", err)
+			}
+			// Note: Tombstone is now gone, proceed with normal creation
+		} else if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("failed to check for existing tombstone: %w", err)
+		}
+	}
+
+	// Insert issue using strict mode (fails on duplicates)
+	// GH#956: Use insertIssueStrict instead of insertIssue to prevent FK constraint errors
+	// from silent INSERT OR IGNORE failures under concurrent load.
+	if err := insertIssueStrict(ctx, conn, issue); err != nil {
 		return wrapDBError("insert issue", err)
 	}
 
@@ -248,6 +308,8 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	defer s.reconnectMu.RUnlock()
 
 	var issue types.Issue
+	var createdAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
+	var updatedAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
 	var closedAt sql.NullTime
 	var estimatedMinutes sql.NullInt64
 	var assignee sql.NullString
@@ -267,6 +329,8 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	var pinned sql.NullInt64
 	// Template field
 	var isTemplate sql.NullInt64
+	// Crystallizes field (work economics)
+	var crystallizes sql.NullInt64
 	// Gate fields
 	var awaitType sql.NullString
 	var awaitID sql.NullString
@@ -286,32 +350,40 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	var actor sql.NullString
 	var target sql.NullString
 	var payload sql.NullString
+	// Time-based scheduling fields (GH#820)
+	var dueAt sql.NullTime
+	var deferUntil sql.NullTime
+	// Custom metadata field (GH#1406)
+	var metadata sql.NullString
 
 	var contentHash sql.NullString
 	var compactedAtCommit sql.NullString
+	var owner sql.NullString
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, updated_at, closed_at, external_ref,
+		       created_at, created_by, owner, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
 		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template,
+		       sender, ephemeral, pinned, is_template, crystallizes,
 		       await_type, await_id, timeout_ns, waiters,
 		       hook_bead, role_bead, agent_state, last_activity, role_type, rig, mol_type,
-		       event_kind, actor, target, payload
+		       event_kind, actor, target, payload,
+		       due_at, defer_until, metadata
 		FROM issues
 		WHERE id = ?
 	`, id).Scan(
 		&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
 		&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
 		&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-		&issue.CreatedAt, &issue.CreatedBy, &issue.UpdatedAt, &closedAt, &externalRef,
+		&createdAtStr, &issue.CreatedBy, &owner, &updatedAtStr, &closedAt, &externalRef,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
 		&deletedAt, &deletedBy, &deleteReason, &originalType,
-		&sender, &wisp, &pinned, &isTemplate,
+		&sender, &wisp, &pinned, &isTemplate, &crystallizes,
 		&awaitType, &awaitID, &timeoutNs, &waiters,
 		&hookBead, &roleBead, &agentState, &lastActivity, &roleType, &rig, &molType,
 		&eventKind, &actor, &target, &payload,
+		&dueAt, &deferUntil, &metadata,
 	)
 
 	if err == sql.ErrNoRows {
@@ -319,6 +391,14 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issue: %w", err)
+	}
+
+	// Parse timestamp strings (TEXT columns require manual parsing)
+	if createdAtStr.Valid {
+		issue.CreatedAt = parseTimeString(createdAtStr.String)
+	}
+	if updatedAtStr.Valid {
+		issue.UpdatedAt = parseTimeString(updatedAtStr.String)
 	}
 
 	if contentHash.Valid {
@@ -333,6 +413,9 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	}
 	if assignee.Valid {
 		issue.Assignee = assignee.String
+	}
+	if owner.Valid {
+		issue.Owner = owner.String
 	}
 	if externalRef.Valid {
 		issue.ExternalRef = &externalRef.String
@@ -376,6 +459,10 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	// Template field
 	if isTemplate.Valid && isTemplate.Int64 != 0 {
 		issue.IsTemplate = true
+	}
+	// Crystallizes field (work economics)
+	if crystallizes.Valid && crystallizes.Int64 != 0 {
+		issue.Crystallizes = true
 	}
 	// Gate fields
 	if awaitType.Valid {
@@ -425,6 +512,17 @@ func (s *SQLiteStorage) GetIssue(ctx context.Context, id string) (*types.Issue, 
 	}
 	if payload.Valid {
 		issue.Payload = payload.String
+	}
+	// Time-based scheduling fields (GH#820)
+	if dueAt.Valid {
+		issue.DueAt = &dueAt.Time
+	}
+	if deferUntil.Valid {
+		issue.DeferUntil = &deferUntil.Time
+	}
+	// Custom metadata field (GH#1406)
+	if metadata.Valid && metadata.String != "" && metadata.String != "{}" {
+		issue.Metadata = []byte(metadata.String)
 	}
 
 	// Fetch labels for this issue
@@ -515,6 +613,8 @@ func (s *SQLiteStorage) GetCloseReasonsForIssues(ctx context.Context, issueIDs [
 // GetIssueByExternalRef retrieves an issue by external reference
 func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef string) (*types.Issue, error) {
 	var issue types.Issue
+	var createdAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
+	var updatedAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
 	var closedAt sql.NullTime
 	var estimatedMinutes sql.NullInt64
 	var assignee sql.NullString
@@ -536,19 +636,22 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 	var pinned sql.NullInt64
 	// Template field
 	var isTemplate sql.NullInt64
+	// Crystallizes field (work economics)
+	var crystallizes sql.NullInt64
 	// Gate fields
 	var awaitType sql.NullString
 	var awaitID sql.NullString
 	var timeoutNs sql.NullInt64
 	var waiters sql.NullString
 
+	var owner sql.NullString
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, updated_at, closed_at, external_ref,
+		       created_at, created_by, owner, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
 		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template,
+		       sender, ephemeral, pinned, is_template, crystallizes,
 		       await_type, await_id, timeout_ns, waiters
 		FROM issues
 		WHERE external_ref = ?
@@ -556,10 +659,10 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 		&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
 		&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
 		&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-		&issue.CreatedAt, &issue.CreatedBy, &issue.UpdatedAt, &closedAt, &externalRefCol,
+		&createdAtStr, &issue.CreatedBy, &owner, &updatedAtStr, &closedAt, &externalRefCol,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
 		&deletedAt, &deletedBy, &deleteReason, &originalType,
-		&sender, &wisp, &pinned, &isTemplate,
+		&sender, &wisp, &pinned, &isTemplate, &crystallizes,
 		&awaitType, &awaitID, &timeoutNs, &waiters,
 	)
 
@@ -568,6 +671,14 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issue by external_ref: %w", err)
+	}
+
+	// Parse timestamp strings (TEXT columns require manual parsing)
+	if createdAtStr.Valid {
+		issue.CreatedAt = parseTimeString(createdAtStr.String)
+	}
+	if updatedAtStr.Valid {
+		issue.UpdatedAt = parseTimeString(updatedAtStr.String)
 	}
 
 	if contentHash.Valid {
@@ -582,6 +693,9 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 	}
 	if assignee.Valid {
 		issue.Assignee = assignee.String
+	}
+	if owner.Valid {
+		issue.Owner = owner.String
 	}
 	if externalRefCol.Valid {
 		issue.ExternalRef = &externalRefCol.String
@@ -625,6 +739,10 @@ func (s *SQLiteStorage) GetIssueByExternalRef(ctx context.Context, externalRef s
 	// Template field
 	if isTemplate.Valid && isTemplate.Int64 != 0 {
 		issue.IsTemplate = true
+	}
+	// Crystallizes field (work economics)
+	if crystallizes.Valid && crystallizes.Int64 != 0 {
+		issue.Crystallizes = true
 	}
 	// Gate fields
 	if awaitType.Valid {
@@ -687,6 +805,14 @@ var allowedUpdateFields = map[string]bool{
 	"event_actor":    true,
 	"event_target":   true,
 	"event_payload":  true,
+	// Time-based scheduling fields (GH#820)
+	"due_at":      true,
+	"defer_until": true,
+	// Gate fields (bd-z6kw: support await_id updates for gate discovery)
+	"await_id": true,
+	"waiters":  true,
+	// Custom metadata field (GH#1406)
+	"metadata": true,
 }
 
 // validatePriority validates a priority value
@@ -769,10 +895,15 @@ func (s *SQLiteStorage) UpdateIssue(ctx context.Context, id string, updates map[
 		return fmt.Errorf("issue %s not found", id)
 	}
 
-	// Fetch custom statuses for validation
+	// Fetch custom statuses and types for validation
 	customStatuses, err := s.GetCustomStatuses(ctx)
 	if err != nil {
 		return wrapDBError("get custom statuses", err)
+	}
+
+	customTypes, err := s.GetCustomTypes(ctx)
+	if err != nil {
+		return wrapDBError("get custom types", err)
 	}
 
 	// Build update query with validated field names
@@ -785,8 +916,8 @@ func (s *SQLiteStorage) UpdateIssue(ctx context.Context, id string, updates map[
 			return fmt.Errorf("invalid field for update: %s", key)
 		}
 
-		// Validate field values (with custom status support)
-		if err := validateFieldUpdateWithCustomStatuses(key, value, customStatuses); err != nil {
+		// Validate field values (with custom status and type support)
+		if err := validateFieldUpdateWithCustom(key, value, customStatuses, customTypes); err != nil {
 			return wrapDBError("validate field update", err)
 		}
 
@@ -796,7 +927,14 @@ func (s *SQLiteStorage) UpdateIssue(ctx context.Context, id string, updates map[
 			columnName = "ephemeral"
 		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = ?", columnName))
-		args = append(args, value)
+
+		// Handle JSON serialization for array fields stored as TEXT
+		if key == "waiters" {
+			waitersJSON, _ := json.Marshal(value)
+			args = append(args, string(waitersJSON))
+		} else {
+			args = append(args, value)
+		}
 	}
 
 	// Auto-manage closed_at when status changes (enforce invariant)
@@ -871,21 +1009,7 @@ func (s *SQLiteStorage) UpdateIssue(ctx context.Context, id string, updates map[
 
 	args = append(args, id)
 
-	// Start transaction
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Update issue
-	query := fmt.Sprintf("UPDATE issues SET %s WHERE id = ?", strings.Join(setClauses, ", ")) // #nosec G201 - safe SQL with controlled column names
-	_, err = tx.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to update issue: %w", err)
-	}
-
-	// Record event
+	// Prepare event data before transaction
 	oldData, err := json.Marshal(oldIssue)
 	if err != nil {
 		// Fall back to minimal description if marshaling fails
@@ -898,38 +1022,47 @@ func (s *SQLiteStorage) UpdateIssue(ctx context.Context, id string, updates map[
 	}
 	oldDataStr := string(oldData)
 	newDataStr := string(newData)
-
 	eventType := determineEventType(oldIssue, updates)
-
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO events (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, ?, ?, ?, ?)
-	`, id, eventType, actor, oldDataStr, newDataStr)
-	if err != nil {
-		return fmt.Errorf("failed to record event: %w", err)
+	statusChanged := false
+	if _, ok := updates["status"]; ok {
+		statusChanged = true
 	}
 
-	// NOTE: Graph edges now managed via AddDependency() per Decision 004 Phase 4.
-
-	// Mark issue as dirty for incremental export
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO dirty_issues (issue_id, marked_at)
-		VALUES (?, ?)
-		ON CONFLICT (issue_id) DO UPDATE SET marked_at = excluded.marked_at
-	`, id, time.Now())
-	if err != nil {
-		return fmt.Errorf("failed to mark issue dirty: %w", err)
-	}
-
-	// Invalidate blocked issues cache if status changed
-	// Status changes affect which issues are blocked (blockers must be open/in_progress/blocked)
-	if _, statusChanged := updates["status"]; statusChanged {
-		if err := s.invalidateBlockedCache(ctx, tx); err != nil {
-			return fmt.Errorf("failed to invalidate blocked cache: %w", err)
+	// Execute in transaction using BEGIN IMMEDIATE (GH#1272 fix)
+	return s.withTx(ctx, func(conn *sql.Conn) error {
+		// Update issue
+		query := fmt.Sprintf("UPDATE issues SET %s WHERE id = ?", strings.Join(setClauses, ", ")) // #nosec G201 - safe SQL with controlled column names
+		_, err := conn.ExecContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("failed to update issue: %w", err)
 		}
-	}
 
-	return tx.Commit()
+		// Record event
+		_, err = conn.ExecContext(ctx, `
+			INSERT INTO events (issue_id, event_type, actor, old_value, new_value)
+			VALUES (?, ?, ?, ?, ?)
+		`, id, eventType, actor, oldDataStr, newDataStr)
+		if err != nil {
+			return fmt.Errorf("failed to record event: %w", err)
+		}
+
+		// NOTE: Graph edges now managed via AddDependency() per Decision 004 Phase 4.
+
+		// Mark issue as dirty for incremental export
+		if err := markDirty(ctx, conn, id); err != nil {
+			return fmt.Errorf("failed to mark issue dirty: %w", err)
+		}
+
+		// Invalidate blocked issues cache if status changed
+		// Status changes affect which issues are blocked (blockers must be open/in_progress/blocked)
+		if statusChanged {
+			if err := s.invalidateBlockedCache(ctx, conn); err != nil {
+				return fmt.Errorf("failed to invalidate blocked cache: %w", err)
+			}
+		}
+
+		return nil
+	})
 }
 
 // UpdateIssueID updates an issue ID and all its text fields in a single transaction
@@ -1047,12 +1180,18 @@ func (s *SQLiteStorage) RenameDependencyPrefix(ctx context.Context, oldPrefix, n
 
 	// Update depends_on_id column
 	_, err = s.db.ExecContext(ctx, `
-		UPDATE dependencies 
+		UPDATE dependencies
 		SET depends_on_id = ? || substr(depends_on_id, length(?) + 1)
 		WHERE depends_on_id LIKE ? || '%'
 	`, newPrefix, oldPrefix, oldPrefix)
 	if err != nil {
 		return fmt.Errorf("failed to update depends_on_id in dependencies: %w", err)
+	}
+
+	// GH#1016: Rebuild blocked_issues_cache since it stores issue IDs
+	// that have now been renamed
+	if err := s.invalidateBlockedCache(ctx, nil); err != nil {
+		return fmt.Errorf("failed to rebuild blocked cache: %w", err)
 	}
 
 	return nil
@@ -1077,135 +1216,122 @@ func (s *SQLiteStorage) ResetCounter(ctx context.Context, prefix string) error {
 func (s *SQLiteStorage) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
 	now := time.Now()
 
-	// Update with special event handling
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// NOTE: close_reason is stored in two places:
-	// 1. issues.close_reason - for direct queries (bd show --json, exports)
-	// 2. events.comment - for audit history (when was it closed, by whom)
-	// Keep both in sync. If refactoring, consider deriving one from the other.
-	result, err := tx.ExecContext(ctx, `
-		UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?
-		WHERE id = ?
-	`, types.StatusClosed, now, now, reason, session, id)
-	if err != nil {
-		return fmt.Errorf("failed to close issue: %w", err)
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-	if rows == 0 {
-		return fmt.Errorf("issue not found: %s", id)
-	}
-
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO events (issue_id, event_type, actor, comment)
-		VALUES (?, ?, ?, ?)
-	`, id, types.EventClosed, actor, reason)
-	if err != nil {
-		return fmt.Errorf("failed to record event: %w", err)
-	}
-
-	// Mark issue as dirty for incremental export
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO dirty_issues (issue_id, marked_at)
-		VALUES (?, ?)
-		ON CONFLICT (issue_id) DO UPDATE SET marked_at = excluded.marked_at
-	`, id, time.Now())
-	if err != nil {
-		return fmt.Errorf("failed to mark issue dirty: %w", err)
-	}
-
-	// Invalidate blocked issues cache since status changed to closed
-	// Closed issues don't block others, so this affects blocking calculations
-	if err := s.invalidateBlockedCache(ctx, tx); err != nil {
-		return fmt.Errorf("failed to invalidate blocked cache: %w", err)
-	}
-
-	// Reactive convoy completion: check if any convoys tracking this issue should auto-close
-	// Find convoys that track this issue (convoy.issue_id tracks closed_issue.depends_on_id)
-	convoyRows, err := tx.QueryContext(ctx, `
-		SELECT DISTINCT d.issue_id
-		FROM dependencies d
-		JOIN issues i ON d.issue_id = i.id
-		WHERE d.depends_on_id = ?
-		  AND d.type = ?
-		  AND i.issue_type = ?
-		  AND i.status != ?
-	`, id, types.DepTracks, types.TypeConvoy, types.StatusClosed)
-	if err != nil {
-		return fmt.Errorf("failed to find tracking convoys: %w", err)
-	}
-	defer func() { _ = convoyRows.Close() }()
-
-	var convoyIDs []string
-	for convoyRows.Next() {
-		var convoyID string
-		if err := convoyRows.Scan(&convoyID); err != nil {
-			return fmt.Errorf("failed to scan convoy ID: %w", err)
+	// Execute in transaction using BEGIN IMMEDIATE (GH#1272 fix)
+	return s.withTx(ctx, func(conn *sql.Conn) error {
+		// NOTE: close_reason is stored in two places:
+		// 1. issues.close_reason - for direct queries (bd show --json, exports)
+		// 2. events.comment - for audit history (when was it closed, by whom)
+		// Keep both in sync. If refactoring, consider deriving one from the other.
+		result, err := conn.ExecContext(ctx, `
+			UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?
+			WHERE id = ?
+		`, types.StatusClosed, now, now, reason, session, id)
+		if err != nil {
+			return fmt.Errorf("failed to close issue: %w", err)
 		}
-		convoyIDs = append(convoyIDs, convoyID)
-	}
-	if err := convoyRows.Err(); err != nil {
-		return fmt.Errorf("convoy rows iteration error: %w", err)
-	}
 
-	// For each convoy, check if all tracked issues are now closed
-	for _, convoyID := range convoyIDs {
-		// Count non-closed tracked issues for this convoy
-		var openCount int
-		err := tx.QueryRowContext(ctx, `
-			SELECT COUNT(*)
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected: %w", err)
+		}
+		if rows == 0 {
+			return fmt.Errorf("issue not found: %s", id)
+		}
+
+		_, err = conn.ExecContext(ctx, `
+			INSERT INTO events (issue_id, event_type, actor, comment)
+			VALUES (?, ?, ?, ?)
+		`, id, types.EventClosed, actor, reason)
+		if err != nil {
+			return fmt.Errorf("failed to record event: %w", err)
+		}
+
+		// Mark issue as dirty for incremental export
+		if err := markDirty(ctx, conn, id); err != nil {
+			return fmt.Errorf("failed to mark issue dirty: %w", err)
+		}
+
+		// Invalidate blocked issues cache since status changed to closed
+		// Closed issues don't block others, so this affects blocking calculations
+		if err := s.invalidateBlockedCache(ctx, conn); err != nil {
+			return fmt.Errorf("failed to invalidate blocked cache: %w", err)
+		}
+
+		// Reactive convoy completion: check if any convoys tracking this issue should auto-close
+		// Find convoys that track this issue (convoy.issue_id tracks closed_issue.depends_on_id)
+		// Uses gt:convoy label instead of issue_type for Gas Town separation
+		convoyRows, err := conn.QueryContext(ctx, `
+			SELECT DISTINCT d.issue_id
 			FROM dependencies d
-			JOIN issues i ON d.depends_on_id = i.id
-			WHERE d.issue_id = ?
+			JOIN issues i ON d.issue_id = i.id
+			JOIN labels l ON i.id = l.issue_id AND l.label = 'gt:convoy'
+			WHERE d.depends_on_id = ?
 			  AND d.type = ?
 			  AND i.status != ?
-			  AND i.status != ?
-		`, convoyID, types.DepTracks, types.StatusClosed, types.StatusTombstone).Scan(&openCount)
+		`, id, types.DepTracks, types.StatusClosed)
 		if err != nil {
-			return fmt.Errorf("failed to count open tracked issues for convoy %s: %w", convoyID, err)
+			return fmt.Errorf("failed to find tracking convoys: %w", err)
+		}
+		defer func() { _ = convoyRows.Close() }()
+
+		var convoyIDs []string
+		for convoyRows.Next() {
+			var convoyID string
+			if err := convoyRows.Scan(&convoyID); err != nil {
+				return fmt.Errorf("failed to scan convoy ID: %w", err)
+			}
+			convoyIDs = append(convoyIDs, convoyID)
+		}
+		if err := convoyRows.Err(); err != nil {
+			return fmt.Errorf("convoy rows iteration error: %w", err)
 		}
 
-		// If all tracked issues are closed, auto-close the convoy
-		if openCount == 0 {
-			closeReason := "All tracked issues completed"
-			_, err := tx.ExecContext(ctx, `
-				UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?
-				WHERE id = ?
-			`, types.StatusClosed, now, now, closeReason, convoyID)
+		// For each convoy, check if all tracked issues are now closed
+		for _, convoyID := range convoyIDs {
+			// Count non-closed tracked issues for this convoy
+			var openCount int
+			err := conn.QueryRowContext(ctx, `
+				SELECT COUNT(*)
+				FROM dependencies d
+				JOIN issues i ON d.depends_on_id = i.id
+				WHERE d.issue_id = ?
+				  AND d.type = ?
+				  AND i.status != ?
+				  AND i.status != ?
+			`, convoyID, types.DepTracks, types.StatusClosed, types.StatusTombstone).Scan(&openCount)
 			if err != nil {
-				return fmt.Errorf("failed to auto-close convoy %s: %w", convoyID, err)
+				return fmt.Errorf("failed to count open tracked issues for convoy %s: %w", convoyID, err)
 			}
 
-			// Record the close event
-			_, err = tx.ExecContext(ctx, `
-				INSERT INTO events (issue_id, event_type, actor, comment)
-				VALUES (?, ?, ?, ?)
-			`, convoyID, types.EventClosed, "system:convoy-completion", closeReason)
-			if err != nil {
-				return fmt.Errorf("failed to record convoy close event: %w", err)
-			}
+			// If all tracked issues are closed, auto-close the convoy
+			if openCount == 0 {
+				closeReason := "All tracked issues completed"
+				_, err := conn.ExecContext(ctx, `
+					UPDATE issues SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?
+					WHERE id = ?
+				`, types.StatusClosed, now, now, closeReason, convoyID)
+				if err != nil {
+					return fmt.Errorf("failed to auto-close convoy %s: %w", convoyID, err)
+				}
 
-			// Mark convoy as dirty
-			_, err = tx.ExecContext(ctx, `
-				INSERT INTO dirty_issues (issue_id, marked_at)
-				VALUES (?, ?)
-				ON CONFLICT (issue_id) DO UPDATE SET marked_at = excluded.marked_at
-			`, convoyID, now)
-			if err != nil {
-				return fmt.Errorf("failed to mark convoy dirty: %w", err)
+				// Record the close event
+				_, err = conn.ExecContext(ctx, `
+					INSERT INTO events (issue_id, event_type, actor, comment)
+					VALUES (?, ?, ?, ?)
+				`, convoyID, types.EventClosed, "system:convoy-completion", closeReason)
+				if err != nil {
+					return fmt.Errorf("failed to record convoy close event: %w", err)
+				}
+
+				// Mark convoy as dirty
+				if err := markDirty(ctx, conn, convoyID); err != nil {
+					return fmt.Errorf("failed to mark convoy dirty: %w", err)
+				}
 			}
 		}
-	}
 
-	return tx.Commit()
+		return nil
+	})
 }
 
 // CreateTombstone converts an existing issue to a tombstone record.
@@ -1222,126 +1348,122 @@ func (s *SQLiteStorage) CreateTombstone(ctx context.Context, id string, actor st
 		return fmt.Errorf("issue not found: %s", id)
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	now := time.Now()
 	originalType := string(issue.IssueType)
 
-	// Convert issue to tombstone
-	// Note: closed_at must be set to NULL because of CHECK constraint:
-	// (status = 'closed') = (closed_at IS NOT NULL)
-	_, err = tx.ExecContext(ctx, `
-		UPDATE issues
-		SET status = ?,
-		    closed_at = NULL,
-		    deleted_at = ?,
-		    deleted_by = ?,
-		    delete_reason = ?,
-		    original_type = ?,
-		    updated_at = ?
-		WHERE id = ?
-	`, types.StatusTombstone, now, actor, reason, originalType, now, id)
-	if err != nil {
-		return fmt.Errorf("failed to create tombstone: %w", err)
-	}
+	// Execute in transaction using BEGIN IMMEDIATE (GH#1272 fix)
+	return s.withTx(ctx, func(conn *sql.Conn) error {
+		// Convert issue to tombstone
+		// Note: closed_at must be set to NULL because of CHECK constraint:
+		// (status = 'closed') = (closed_at IS NOT NULL)
+		_, err := conn.ExecContext(ctx, `
+			UPDATE issues
+			SET status = ?,
+			    closed_at = NULL,
+			    deleted_at = ?,
+			    deleted_by = ?,
+			    delete_reason = ?,
+			    original_type = ?,
+			    updated_at = ?
+			WHERE id = ?
+		`, types.StatusTombstone, now, actor, reason, originalType, now, id)
+		if err != nil {
+			return fmt.Errorf("failed to create tombstone: %w", err)
+		}
 
-	// Record tombstone creation event
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO events (issue_id, event_type, actor, comment)
-		VALUES (?, ?, ?, ?)
-	`, id, "deleted", actor, reason)
-	if err != nil {
-		return fmt.Errorf("failed to record tombstone event: %w", err)
-	}
+		// Record tombstone creation event
+		_, err = conn.ExecContext(ctx, `
+			INSERT INTO events (issue_id, event_type, actor, comment)
+			VALUES (?, ?, ?, ?)
+		`, id, "deleted", actor, reason)
+		if err != nil {
+			return fmt.Errorf("failed to record tombstone event: %w", err)
+		}
 
-	// Mark issue as dirty for incremental export
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO dirty_issues (issue_id, marked_at)
-		VALUES (?, ?)
-		ON CONFLICT (issue_id) DO UPDATE SET marked_at = excluded.marked_at
-	`, id, now)
-	if err != nil {
-		return fmt.Errorf("failed to mark issue dirty: %w", err)
-	}
+		// Mark issue as dirty for incremental export
+		if err := markDirty(ctx, conn, id); err != nil {
+			return fmt.Errorf("failed to mark issue dirty: %w", err)
+		}
 
-	// Invalidate blocked issues cache since status changed
-	// Tombstone issues don't block others, so this affects blocking calculations
-	if err := s.invalidateBlockedCache(ctx, tx); err != nil {
-		return fmt.Errorf("failed to invalidate blocked cache: %w", err)
-	}
+		// Invalidate blocked issues cache since status changed
+		// Tombstone issues don't block others, so this affects blocking calculations
+		if err := s.invalidateBlockedCache(ctx, conn); err != nil {
+			return fmt.Errorf("failed to invalidate blocked cache: %w", err)
+		}
 
-	if err := tx.Commit(); err != nil {
-		return wrapDBError("commit tombstone transaction", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 // DeleteIssue permanently removes an issue from the database
 func (s *SQLiteStorage) DeleteIssue(ctx context.Context, id string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.withTx(ctx, func(conn *sql.Conn) error {
+		// Mark issues that depend on this one as dirty so they get re-exported
+		// without the stale dependency reference (fixes orphan deps in JSONL)
+		rows, err := conn.QueryContext(ctx, `SELECT issue_id FROM dependencies WHERE depends_on_id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("failed to query dependent issues: %w", err)
+		}
+		var dependentIDs []string
+		for rows.Next() {
+			var depID string
+			if err := rows.Scan(&depID); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("failed to scan dependent issue ID: %w", err)
+			}
+			dependentIDs = append(dependentIDs, depID)
+		}
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("failed to iterate dependent issues: %w", err)
+		}
 
-	// Delete dependencies (both directions)
-	_, err = tx.ExecContext(ctx, `DELETE FROM dependencies WHERE issue_id = ? OR depends_on_id = ?`, id, id)
-	if err != nil {
-		return fmt.Errorf("failed to delete dependencies: %w", err)
-	}
+		if len(dependentIDs) > 0 {
+			if err := markIssuesDirtyTx(ctx, conn, dependentIDs); err != nil {
+				return fmt.Errorf("failed to mark dependent issues dirty: %w", err)
+			}
+		}
 
-	// Delete events
-	_, err = tx.ExecContext(ctx, `DELETE FROM events WHERE issue_id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("failed to delete events: %w", err)
-	}
+		// Delete dependencies (both directions)
+		_, err = conn.ExecContext(ctx, `DELETE FROM dependencies WHERE issue_id = ? OR depends_on_id = ?`, id, id)
+		if err != nil {
+			return fmt.Errorf("failed to delete dependencies: %w", err)
+		}
 
-	// Delete comments (no FK cascade on this table)
-	_, err = tx.ExecContext(ctx, `DELETE FROM comments WHERE issue_id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("failed to delete comments: %w", err)
-	}
+		// Delete events
+		_, err = conn.ExecContext(ctx, `DELETE FROM events WHERE issue_id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("failed to delete events: %w", err)
+		}
 
-	// Delete from dirty_issues
-	_, err = tx.ExecContext(ctx, `DELETE FROM dirty_issues WHERE issue_id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("failed to delete dirty marker: %w", err)
-	}
+		// Delete comments (no FK cascade on this table)
+		_, err = conn.ExecContext(ctx, `DELETE FROM comments WHERE issue_id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("failed to delete comments: %w", err)
+		}
 
-	// Delete the issue itself
-	result, err := tx.ExecContext(ctx, `DELETE FROM issues WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("failed to delete issue: %w", err)
-	}
+		// Delete from dirty_issues
+		_, err = conn.ExecContext(ctx, `DELETE FROM dirty_issues WHERE issue_id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("failed to delete dirty marker: %w", err)
+		}
 
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to check rows affected: %w", err)
-	}
-	if rowsAffected == 0 {
-		return fmt.Errorf("issue not found: %s", id)
-	}
+		// Delete the issue itself
+		result, err := conn.ExecContext(ctx, `DELETE FROM issues WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("failed to delete issue: %w", err)
+		}
 
-	if err := tx.Commit(); err != nil {
-		return wrapDBError("commit delete transaction", err)
-	}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to check rows affected: %w", err)
+		}
+		if rowsAffected == 0 {
+			return fmt.Errorf("issue not found: %s", id)
+		}
 
-	// REMOVED: Counter sync after deletion - no longer needed with hash IDs
-	return nil
-}
-
-// DeleteIssuesResult contains statistics about a batch deletion operation
-type DeleteIssuesResult struct {
-	DeletedCount      int
-	DependenciesCount int
-	LabelsCount       int
-	EventsCount       int
-	OrphanedIssues    []string
+		return nil
+	})
 }
 
 // DeleteIssues deletes multiple issues in a single transaction
@@ -1349,40 +1471,39 @@ type DeleteIssuesResult struct {
 // If cascade is false but force is true, deletes issues and orphans their dependents
 // If cascade and force are both false, returns an error if any issue has dependents
 // If dryRun is true, only computes statistics without deleting
-func (s *SQLiteStorage) DeleteIssues(ctx context.Context, ids []string, cascade bool, force bool, dryRun bool) (*DeleteIssuesResult, error) {
+func (s *SQLiteStorage) DeleteIssues(ctx context.Context, ids []string, cascade bool, force bool, dryRun bool) (*types.DeleteIssuesResult, error) {
 	if len(ids) == 0 {
-		return &DeleteIssuesResult{}, nil
+		return &types.DeleteIssuesResult{}, nil
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
 
 	idSet := buildIDSet(ids)
-	result := &DeleteIssuesResult{}
+	result := &types.DeleteIssuesResult{}
 
-	expandedIDs, err := s.resolveDeleteSet(ctx, tx, ids, idSet, cascade, force, result)
+	// Execute in transaction using BEGIN IMMEDIATE (GH#1272 fix)
+	err := s.withTx(ctx, func(conn *sql.Conn) error {
+		expandedIDs, err := s.resolveDeleteSet(ctx, conn, ids, idSet, cascade, force, result)
+		if err != nil {
+			return wrapDBError("resolve delete set", err)
+		}
+
+		inClause, args := buildSQLInClause(expandedIDs)
+		if err := s.populateDeleteStats(ctx, conn, inClause, args, result); err != nil {
+			return err
+		}
+
+		if dryRun {
+			return nil
+		}
+
+		if err := s.executeDelete(ctx, conn, inClause, args, result); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
 	if err != nil {
-		return nil, wrapDBError("resolve delete set", err)
-	}
-
-	inClause, args := buildSQLInClause(expandedIDs)
-	if err := s.populateDeleteStats(ctx, tx, inClause, args, result); err != nil {
 		return nil, err
-	}
-
-	if dryRun {
-		return result, nil
-	}
-
-	if err := s.executeDelete(ctx, tx, inClause, args, result); err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	// REMOVED: Counter sync after deletion - no longer needed with hash IDs
@@ -1398,18 +1519,18 @@ func buildIDSet(ids []string) map[string]bool {
 	return idSet
 }
 
-func (s *SQLiteStorage) resolveDeleteSet(ctx context.Context, tx *sql.Tx, ids []string, idSet map[string]bool, cascade bool, force bool, result *DeleteIssuesResult) ([]string, error) {
+func (s *SQLiteStorage) resolveDeleteSet(ctx context.Context, exec dbExecutor, ids []string, idSet map[string]bool, cascade bool, force bool, result *types.DeleteIssuesResult) ([]string, error) {
 	if cascade {
-		return s.expandWithDependents(ctx, tx, ids, idSet)
+		return s.expandWithDependents(ctx, exec, ids, idSet)
 	}
 	if !force {
-		return ids, s.validateNoDependents(ctx, tx, ids, idSet, result)
+		return ids, s.validateNoDependents(ctx, exec, ids, idSet, result)
 	}
-	return ids, s.trackOrphanedIssues(ctx, tx, ids, idSet, result)
+	return ids, s.trackOrphanedIssues(ctx, exec, ids, idSet, result)
 }
 
-func (s *SQLiteStorage) expandWithDependents(ctx context.Context, tx *sql.Tx, ids []string, _ map[string]bool) ([]string, error) {
-	allToDelete, err := s.findAllDependentsRecursive(ctx, tx, ids)
+func (s *SQLiteStorage) expandWithDependents(ctx context.Context, exec dbExecutor, ids []string, _ map[string]bool) ([]string, error) {
+	allToDelete, err := s.findAllDependentsRecursive(ctx, exec, ids)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find dependents: %w", err)
 	}
@@ -1420,18 +1541,18 @@ func (s *SQLiteStorage) expandWithDependents(ctx context.Context, tx *sql.Tx, id
 	return expandedIDs, nil
 }
 
-func (s *SQLiteStorage) validateNoDependents(ctx context.Context, tx *sql.Tx, ids []string, idSet map[string]bool, result *DeleteIssuesResult) error {
+func (s *SQLiteStorage) validateNoDependents(ctx context.Context, exec dbExecutor, ids []string, idSet map[string]bool, result *types.DeleteIssuesResult) error {
 	for _, id := range ids {
-		if err := s.checkSingleIssueValidation(ctx, tx, id, idSet, result); err != nil {
+		if err := s.checkSingleIssueValidation(ctx, exec, id, idSet, result); err != nil {
 			return wrapDBError("check dependents", err)
 		}
 	}
 	return nil
 }
 
-func (s *SQLiteStorage) checkSingleIssueValidation(ctx context.Context, tx *sql.Tx, id string, idSet map[string]bool, result *DeleteIssuesResult) error {
+func (s *SQLiteStorage) checkSingleIssueValidation(ctx context.Context, exec dbExecutor, id string, idSet map[string]bool, result *types.DeleteIssuesResult) error {
 	var depCount int
-	err := tx.QueryRowContext(ctx,
+	err := exec.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM dependencies WHERE depends_on_id = ?`, id).Scan(&depCount)
 	if err != nil {
 		return fmt.Errorf("failed to check dependents for %s: %w", id, err)
@@ -1440,7 +1561,7 @@ func (s *SQLiteStorage) checkSingleIssueValidation(ctx context.Context, tx *sql.
 		return nil
 	}
 
-	rows, err := tx.QueryContext(ctx,
+	rows, err := exec.QueryContext(ctx,
 		`SELECT issue_id FROM dependencies WHERE depends_on_id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("failed to get dependents for %s: %w", id, err)
@@ -1469,10 +1590,10 @@ func (s *SQLiteStorage) checkSingleIssueValidation(ctx context.Context, tx *sql.
 	return nil
 }
 
-func (s *SQLiteStorage) trackOrphanedIssues(ctx context.Context, tx *sql.Tx, ids []string, idSet map[string]bool, result *DeleteIssuesResult) error {
+func (s *SQLiteStorage) trackOrphanedIssues(ctx context.Context, exec dbExecutor, ids []string, idSet map[string]bool, result *types.DeleteIssuesResult) error {
 	orphanSet := make(map[string]bool)
 	for _, id := range ids {
-		if err := s.collectOrphansForID(ctx, tx, id, idSet, orphanSet); err != nil {
+		if err := s.collectOrphansForID(ctx, exec, id, idSet, orphanSet); err != nil {
 			return wrapDBError("collect orphans", err)
 		}
 	}
@@ -1482,8 +1603,8 @@ func (s *SQLiteStorage) trackOrphanedIssues(ctx context.Context, tx *sql.Tx, ids
 	return nil
 }
 
-func (s *SQLiteStorage) collectOrphansForID(ctx context.Context, tx *sql.Tx, id string, idSet map[string]bool, orphanSet map[string]bool) error {
-	rows, err := tx.QueryContext(ctx,
+func (s *SQLiteStorage) collectOrphansForID(ctx context.Context, exec dbExecutor, id string, idSet map[string]bool, orphanSet map[string]bool) error {
+	rows, err := exec.QueryContext(ctx,
 		`SELECT issue_id FROM dependencies WHERE depends_on_id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("failed to get dependents for %s: %w", id, err)
@@ -1512,7 +1633,7 @@ func buildSQLInClause(ids []string) (string, []interface{}) {
 	return strings.Join(placeholders, ","), args
 }
 
-func (s *SQLiteStorage) populateDeleteStats(ctx context.Context, tx *sql.Tx, inClause string, args []interface{}, result *DeleteIssuesResult) error {
+func (s *SQLiteStorage) populateDeleteStats(ctx context.Context, exec dbExecutor, inClause string, args []interface{}, result *types.DeleteIssuesResult) error {
 	counts := []struct {
 		query string
 		dest  *int
@@ -1527,7 +1648,7 @@ func (s *SQLiteStorage) populateDeleteStats(ctx context.Context, tx *sql.Tx, inC
 		if c.dest == &result.DependenciesCount {
 			queryArgs = append(args, args...)
 		}
-		if err := tx.QueryRowContext(ctx, c.query, queryArgs...).Scan(c.dest); err != nil {
+		if err := exec.QueryRowContext(ctx, c.query, queryArgs...).Scan(c.dest); err != nil {
 			return fmt.Errorf("failed to count: %w", err)
 		}
 	}
@@ -1536,12 +1657,12 @@ func (s *SQLiteStorage) populateDeleteStats(ctx context.Context, tx *sql.Tx, inC
 	return nil
 }
 
-func (s *SQLiteStorage) executeDelete(ctx context.Context, tx *sql.Tx, inClause string, args []interface{}, result *DeleteIssuesResult) error {
+func (s *SQLiteStorage) executeDelete(ctx context.Context, exec dbExecutor, inClause string, args []interface{}, result *types.DeleteIssuesResult) error {
 	// Note: This method now creates tombstones instead of hard-deleting
 	// Only dependencies are deleted - issues are converted to tombstones
 
 	// 1. Delete dependencies - tombstones don't block other issues
-	_, err := tx.ExecContext(ctx,
+	_, err := exec.ExecContext(ctx,
 		fmt.Sprintf(`DELETE FROM dependencies WHERE issue_id IN (%s) OR depends_on_id IN (%s)`, inClause, inClause),
 		append(args, args...)...)
 	if err != nil {
@@ -1550,7 +1671,7 @@ func (s *SQLiteStorage) executeDelete(ctx context.Context, tx *sql.Tx, inClause 
 
 	// 2. Get issue types before converting to tombstones (need for original_type)
 	issueTypes := make(map[string]string)
-	rows, err := tx.QueryContext(ctx,
+	rows, err := exec.QueryContext(ctx,
 		fmt.Sprintf(`SELECT id, issue_type FROM issues WHERE id IN (%s)`, inClause),
 		args...)
 	if err != nil {
@@ -1572,7 +1693,7 @@ func (s *SQLiteStorage) executeDelete(ctx context.Context, tx *sql.Tx, inClause 
 	now := time.Now()
 	deletedCount := 0
 	for id, originalType := range issueTypes {
-		execResult, err := tx.ExecContext(ctx, `
+		execResult, err := exec.ExecContext(ctx, `
 			UPDATE issues
 			SET status = ?,
 			    closed_at = NULL,
@@ -1594,7 +1715,7 @@ func (s *SQLiteStorage) executeDelete(ctx context.Context, tx *sql.Tx, inClause 
 		deletedCount++
 
 		// Record tombstone creation event
-		_, err = tx.ExecContext(ctx, `
+		_, err = exec.ExecContext(ctx, `
 			INSERT INTO events (issue_id, event_type, actor, comment)
 			VALUES (?, ?, ?, ?)
 		`, id, "deleted", "batch delete", "batch delete")
@@ -1603,7 +1724,7 @@ func (s *SQLiteStorage) executeDelete(ctx context.Context, tx *sql.Tx, inClause 
 		}
 
 		// Mark issue as dirty for incremental export
-		_, err = tx.ExecContext(ctx, `
+		_, err = exec.ExecContext(ctx, `
 			INSERT INTO dirty_issues (issue_id, marked_at)
 			VALUES (?, ?)
 			ON CONFLICT (issue_id) DO UPDATE SET marked_at = excluded.marked_at
@@ -1614,7 +1735,7 @@ func (s *SQLiteStorage) executeDelete(ctx context.Context, tx *sql.Tx, inClause 
 	}
 
 	// 4. Invalidate blocked issues cache since statuses changed
-	if err := s.invalidateBlockedCache(ctx, tx); err != nil {
+	if err := s.invalidateBlockedCache(ctx, exec); err != nil {
 		return fmt.Errorf("failed to invalidate blocked cache: %w", err)
 	}
 
@@ -1623,7 +1744,7 @@ func (s *SQLiteStorage) executeDelete(ctx context.Context, tx *sql.Tx, inClause 
 }
 
 // findAllDependentsRecursive finds all issues that depend on the given issues, recursively
-func (s *SQLiteStorage) findAllDependentsRecursive(ctx context.Context, tx *sql.Tx, ids []string) (map[string]bool, error) {
+func (s *SQLiteStorage) findAllDependentsRecursive(ctx context.Context, exec dbExecutor, ids []string) (map[string]bool, error) {
 	result := make(map[string]bool)
 	for _, id := range ids {
 		result[id] = true
@@ -1636,7 +1757,7 @@ func (s *SQLiteStorage) findAllDependentsRecursive(ctx context.Context, tx *sql.
 		current := toProcess[0]
 		toProcess = toProcess[1:]
 
-		rows, err := tx.QueryContext(ctx,
+		rows, err := exec.QueryContext(ctx,
 			`SELECT issue_id FROM dependencies WHERE depends_on_id = ?`, current)
 		if err != nil {
 			return nil, err
@@ -1717,6 +1838,16 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 			args = append(args, string(s))
 		}
 		whereClauses = append(whereClauses, fmt.Sprintf("status NOT IN (%s)", strings.Join(placeholders, ",")))
+	}
+
+	// Type exclusion (for hiding internal types like gates, bd-7zka.2)
+	if len(filter.ExcludeTypes) > 0 {
+		placeholders := make([]string, len(filter.ExcludeTypes))
+		for i, t := range filter.ExcludeTypes {
+			placeholders[i] = "?"
+			args = append(args, string(t))
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("issue_type NOT IN (%s)", strings.Join(placeholders, ",")))
 	}
 
 	if filter.Priority != nil {
@@ -1809,6 +1940,12 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 		whereClauses = append(whereClauses, fmt.Sprintf("id IN (%s)", strings.Join(placeholders, ", ")))
 	}
 
+	// ID prefix filtering (for shell completion)
+	if filter.IDPrefix != "" {
+		whereClauses = append(whereClauses, "id LIKE ?")
+		args = append(args, filter.IDPrefix+"%")
+	}
+
 	// Wisp filtering
 	if filter.Ephemeral != nil {
 		if *filter.Ephemeral {
@@ -1848,6 +1985,31 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 		args = append(args, string(*filter.MolType))
 	}
 
+	// Time-based scheduling filters (GH#820)
+	if filter.Deferred {
+		whereClauses = append(whereClauses, "defer_until IS NOT NULL")
+	}
+	if filter.DeferAfter != nil {
+		whereClauses = append(whereClauses, "defer_until > ?")
+		args = append(args, filter.DeferAfter.Format(time.RFC3339))
+	}
+	if filter.DeferBefore != nil {
+		whereClauses = append(whereClauses, "defer_until < ?")
+		args = append(args, filter.DeferBefore.Format(time.RFC3339))
+	}
+	if filter.DueAfter != nil {
+		whereClauses = append(whereClauses, "due_at > ?")
+		args = append(args, filter.DueAfter.Format(time.RFC3339))
+	}
+	if filter.DueBefore != nil {
+		whereClauses = append(whereClauses, "due_at < ?")
+		args = append(args, filter.DueBefore.Format(time.RFC3339))
+	}
+	if filter.Overdue {
+		whereClauses = append(whereClauses, "due_at IS NOT NULL AND due_at < ? AND status != ?")
+		args = append(args, time.Now().Format(time.RFC3339), types.StatusClosed)
+	}
+
 	whereSQL := ""
 	if len(whereClauses) > 0 {
 		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
@@ -1863,10 +2025,12 @@ func (s *SQLiteStorage) SearchIssues(ctx context.Context, query string, filter t
 	querySQL := fmt.Sprintf(`
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, updated_at, closed_at, external_ref, source_repo, close_reason,
+		       created_at, created_by, owner, updated_at, closed_at, external_ref, source_repo, close_reason,
 		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template,
-		       await_type, await_id, timeout_ns, waiters
+		       sender, ephemeral, pinned, is_template, crystallizes,
+		       await_type, await_id, timeout_ns, waiters,
+		       hook_bead, role_bead, agent_state, last_activity, role_type, rig, mol_type,
+		       due_at, defer_until, metadata
 		FROM issues
 		%s
 		ORDER BY priority ASC, created_at DESC

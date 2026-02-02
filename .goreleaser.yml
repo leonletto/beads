@@ -13,7 +13,7 @@ builds:
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=1
+      - CGO_ENABLED=0
     goos:
       - linux
     goarch:
@@ -29,11 +29,25 @@ builds:
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=1
-      - CC=aarch64-linux-gnu-gcc
-      - CXX=aarch64-linux-gnu-g++
+      - CGO_ENABLED=0
     goos:
       - linux
+    goarch:
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.Build={{.ShortCommit}}
+      - -X main.Commit={{.Commit}}
+      - -X main.Branch={{.Branch}}
+
+  - id: bd-android-arm64
+    main: ./cmd/bd
+    binary: bd
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - android
     goarch:
       - arm64
     ldflags:
@@ -47,7 +61,7 @@ builds:
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=1
+      - CGO_ENABLED=0
     goos:
       - darwin
     goarch:
@@ -63,7 +77,7 @@ builds:
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=1
+      - CGO_ENABLED=0
     goos:
       - darwin
     goarch:
@@ -79,13 +93,33 @@ builds:
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=1
-      - CC=x86_64-w64-mingw32-gcc
-      - CXX=x86_64-w64-mingw32-g++
+      - CGO_ENABLED=0
     goos:
       - windows
     goarch:
       - amd64
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.Build={{.ShortCommit}}
+      - -X main.Commit={{.Commit}}
+      - -X main.Branch={{.Branch}}
+      - -buildmode=exe
+    hooks:
+      post:
+        # Sign Windows executable with Authenticode certificate
+        # Requires WINDOWS_SIGNING_CERT_PFX_BASE64 and WINDOWS_SIGNING_CERT_PASSWORD secrets
+        - ./scripts/sign-windows.sh "{{ .Path }}"
+
+  - id: bd-windows-arm64
+    main: ./cmd/bd
+    binary: bd
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+    goarch:
+      - arm64
     ldflags:
       - -s -w
       - -X main.Version={{.Version}}
@@ -114,7 +148,6 @@ builds:
       - -X main.Build={{.ShortCommit}}
       - -X main.Commit={{.Commit}}
       - -X main.Branch={{.Branch}}
-
 
 archives:
   - id: bd-archive
@@ -163,44 +196,28 @@ release:
   name_template: "v{{.Version}}"
   header: |
     ## beads v{{.Version}}
-    
-    Pre-compiled binaries for Linux, macOS (Intel & Apple Silicon), and Windows.
-    
+
+    Pre-compiled binaries for Linux, macOS (Intel & Apple Silicon), Windows (AMD64 & ARM64), Android/Termux (ARM64), and FreeBSD.
+
     ### Installation
-    
+
     **Homebrew (macOS/Linux):**
     ```bash
-    brew install steveyegge/beads/bd
+    brew install beads
     ```
-    
-    **Quick Install (macOS/Linux):**
+
+    **Quick Install (macOS/Linux/FreeBSD):**
     ```bash
     curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
     ```
-    
+
     **Windows (PowerShell):**
     ```powershell
     irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
     ```
-    
+
     **Manual Install:**
     Download the appropriate binary for your platform below, extract it, and place it in your PATH.
-
-# Homebrew tap - disabled, handled by separate workflow
-# brews:
-#   - name: bd
-#     repository:
-#       owner: steveyegge
-#       name: homebrew-beads
-#       branch: main
-#     directory: Formula
-#     homepage: https://github.com/steveyegge/beads
-#     description: "AI-supervised issue tracker for coding workflows"
-#     license: MIT
-#     test: |
-#       system "#{bin}/bd", "version"
-#     install: |
-#       bin.install "bd"
 
 # Announce the release
 announce:

@@ -4,25 +4,29 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime/pprof"
 	"runtime/trace"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/molecules"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/factory"
 	"github.com/steveyegge/beads/internal/storage/memory"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/utils"
 )
 
@@ -68,18 +72,45 @@ var (
 	upgradeAcknowledged    = false // Set to true after showing upgrade notification once per session
 )
 var (
-	noAutoFlush    bool
-	noAutoImport   bool
-	sandboxMode    bool
-	allowStale     bool          // Use --allow-stale: skip staleness check (emergency escape hatch)
-	noDb           bool          // Use --no-db mode: load from JSONL, write back after each command
-	readonlyMode   bool          // Read-only mode: block write operations (for worker sandboxes)
-	lockTimeout    time.Duration // SQLite busy_timeout (default 30s, 0 = fail immediately)
-	profileEnabled bool
-	profileFile    *os.File
-	traceFile      *os.File
-	verboseFlag    bool // Enable verbose/debug output
-	quietFlag      bool // Suppress non-essential output
+	noAutoFlush     bool
+	noAutoImport    bool
+	sandboxMode     bool
+	allowStale      bool          // Use --allow-stale: skip staleness check (emergency escape hatch)
+	noDb            bool          // Use --no-db mode: load from JSONL, write back after each command
+	readonlyMode    bool          // Read-only mode: block write operations (for worker sandboxes)
+	storeIsReadOnly bool          // Track if store was opened read-only (for staleness checks)
+	lockTimeout     time.Duration // SQLite busy_timeout (default 30s, 0 = fail immediately)
+	profileEnabled  bool
+	profileFile     *os.File
+	traceFile       *os.File
+	verboseFlag     bool // Enable verbose/debug output
+	quietFlag       bool // Suppress non-essential output
+
+	// Dolt auto-commit policy (flag/config). Values: off | on
+	doltAutoCommit string
+
+	// commandDidWrite is set when a command performs a write that should trigger
+	// auto-flush. Used to decide whether to auto-commit Dolt after the command completes.
+	// Thread-safe via atomic.Bool to avoid data races in concurrent flush operations.
+	commandDidWrite atomic.Bool
+
+	// commandDidExplicitDoltCommit is set when a command already created a Dolt commit
+	// explicitly (e.g., bd sync in dolt-native mode, hook flows, bd vc commit).
+	// This prevents a redundant auto-commit attempt in PersistentPostRun.
+	commandDidExplicitDoltCommit bool
+
+	// commandDidWriteTipMetadata is set when a command records a tip as "shown" by writing
+	// metadata (tip_*_last_shown). This will be used to create a separate Dolt commit for
+	// tip writes, even when the main command is read-only.
+	commandDidWriteTipMetadata bool
+
+	// commandTipIDsShown tracks which tip IDs were shown in this command (deduped).
+	// This is used for tip-commit message formatting.
+	commandTipIDsShown map[string]struct{}
+
+	// processSem holds the file-based semaphore slot acquired before opening
+	// a dolt database. Released in PersistentPostRun after store.Close().
+	processSem *ProcessSemaphore
 )
 
 // readOnlyCommands lists commands that only read from the database.
@@ -96,7 +127,8 @@ var readOnlyCommands = map[string]bool{
 	"graph":      true,
 	"duplicates": true,
 	"comments":   true, // list comments (not add)
-	"export":     true, // export only reads
+	"current":    true, // bd sync mode current
+	// NOTE: "export" is NOT read-only - it writes to clear dirty issues and update jsonl_file_hash
 }
 
 // isReadOnlyCommand returns true if the command only reads from the database.
@@ -104,6 +136,62 @@ var readOnlyCommands = map[string]bool{
 // that would trigger file watchers. See GH#804.
 func isReadOnlyCommand(cmdName string) bool {
 	return readOnlyCommands[cmdName]
+}
+
+// getActorWithGit returns the actor for audit trails with git config fallback.
+// Priority: --actor flag > BD_ACTOR env > BEADS_ACTOR env > git config user.name > $USER > "unknown"
+// This provides a sensible default for developers: their git identity is used unless
+// explicitly overridden
+func getActorWithGit() string {
+	// If actor is already set (from --actor flag), use it
+	if actor != "" {
+		return actor
+	}
+
+	// Check BD_ACTOR env var (primary env override)
+	if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
+		return bdActor
+	}
+
+	// Check BEADS_ACTOR env var (alias for MCP/integration compatibility)
+	if beadsActor := os.Getenv("BEADS_ACTOR"); beadsActor != "" {
+		return beadsActor
+	}
+
+	// Try git config user.name - the natural default for a git-native tool
+	if out, err := exec.Command("git", "config", "user.name").Output(); err == nil {
+		if gitUser := strings.TrimSpace(string(out)); gitUser != "" {
+			return gitUser
+		}
+	}
+
+	// Fall back to system username
+	if user := os.Getenv("USER"); user != "" {
+		return user
+	}
+
+	return "unknown"
+}
+
+// getOwner returns the human owner for CV attribution.
+// Priority: GIT_AUTHOR_EMAIL env > git config user.email > "" (empty)
+// This is the foundation for HOP CV (curriculum vitae) chains per Decision 008.
+// Unlike actor (which tracks who executed), owner tracks the human responsible.
+func getOwner() string {
+	// Check GIT_AUTHOR_EMAIL first - this is set during git commit operations
+	if authorEmail := os.Getenv("GIT_AUTHOR_EMAIL"); authorEmail != "" {
+		return authorEmail
+	}
+
+	// Fall back to git config user.email - the natural default
+	if out, err := exec.Command("git", "config", "user.email").Output(); err == nil {
+		if gitEmail := strings.TrimSpace(string(out)); gitEmail != "" {
+			return gitEmail
+		}
+	}
+
+	// Return empty if no email found (owner is optional)
+	return ""
 }
 
 func init() {
@@ -120,7 +208,7 @@ func init() {
 
 	// Register persistent flags
 	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: auto-discover .beads/*.db)")
-	rootCmd.PersistentFlags().StringVar(&actor, "actor", "", "Actor name for audit trail (default: $BD_ACTOR or $USER)")
+	rootCmd.PersistentFlags().StringVar(&actor, "actor", "", "Actor name for audit trail (default: $BD_ACTOR, git user.name, $USER)")
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 	rootCmd.PersistentFlags().BoolVar(&noDaemon, "no-daemon", false, "Force direct storage mode, bypass daemon if running")
 	rootCmd.PersistentFlags().BoolVar(&noAutoFlush, "no-auto-flush", false, "Disable automatic JSONL sync after CRUD operations")
@@ -129,6 +217,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&allowStale, "allow-stale", false, "Allow operations on potentially stale data (skip staleness check)")
 	rootCmd.PersistentFlags().BoolVar(&noDb, "no-db", false, "Use no-db mode: load from JSONL, no SQLite")
 	rootCmd.PersistentFlags().BoolVar(&readonlyMode, "readonly", false, "Read-only mode: block write operations (for worker sandboxes)")
+	rootCmd.PersistentFlags().StringVar(&doltAutoCommit, "dolt-auto-commit", "", "Dolt backend: auto-commit after write commands (off|on). Default from config key dolt.auto-commit")
 	rootCmd.PersistentFlags().DurationVar(&lockTimeout, "lock-timeout", 30*time.Second, "SQLite busy timeout (0 = fail immediately if locked)")
 	rootCmd.PersistentFlags().BoolVar(&profileEnabled, "profile", false, "Generate CPU profile for performance analysis")
 	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose/debug output")
@@ -171,11 +260,14 @@ var rootCmd = &cobra.Command{
 		// Initialize CommandContext to hold runtime state (replaces scattered globals)
 		initCommandContext()
 
+		// Reset per-command write tracking (used by Dolt auto-commit).
+		commandDidWrite.Store(false)
+		commandDidExplicitDoltCommit = false
+		commandDidWriteTipMetadata = false
+		commandTipIDsShown = make(map[string]struct{})
+
 		// Set up signal-aware context for graceful cancellation
 		rootCtx, rootCancel = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-
-		// Signal orchestrator daemon about bd activity (best-effort, for exponential backoff)
-		defer signalOrchestratorActivity()
 
 		// Apply verbosity flags early (before any output)
 		debug.SetVerbose(verboseFlag)
@@ -264,6 +356,14 @@ var rootCmd = &cobra.Command{
 				WasSet bool
 			}{actor, true}
 		}
+		if !cmd.Flags().Changed("dolt-auto-commit") && strings.TrimSpace(doltAutoCommit) == "" {
+			doltAutoCommit = config.GetString("dolt.auto-commit")
+		} else if cmd.Flags().Changed("dolt-auto-commit") {
+			flagOverrides["dolt-auto-commit"] = struct {
+				Value  interface{}
+				WasSet bool
+			}{doltAutoCommit, true}
+		}
 
 		// Check for and log configuration overrides (only in verbose mode)
 		if verboseFlag {
@@ -273,29 +373,19 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		// Protect forks from accidentally committing upstream issue database
-		ensureForkProtection()
-
-		// Performance profiling setup
-		// When --profile is enabled, force direct mode to capture actual database operations
-		// rather than just RPC serialization/network overhead. This gives accurate profiles
-		// of the storage layer, query performance, and business logic.
-		if profileEnabled {
-			noDaemon = true
-			timestamp := time.Now().Format("20060102-150405")
-			if f, _ := os.Create(fmt.Sprintf("bd-profile-%s-%s.prof", cmd.Name(), timestamp)); f != nil {
-				profileFile = f
-				_ = pprof.StartCPUProfile(f)
-			}
-			if f, _ := os.Create(fmt.Sprintf("bd-trace-%s-%s.out", cmd.Name(), timestamp)); f != nil {
-				traceFile = f
-				_ = trace.Start(f)
-			}
+		// Validate Dolt auto-commit mode early so all commands fail fast on invalid config.
+		if _, err := getDoltAutoCommitMode(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
 		}
 
-		// Skip database initialization for commands that don't need a database
+		// GH#1093: Check noDbCommands BEFORE expensive operations (ensureForkProtection,
+		// signalOrchestratorActivity) to avoid spawning git subprocesses for simple commands
+		// like "bd version" that don't need database access.
 		noDbCommands := []string{
 			cmdDaemon,
+			"__complete",       // Cobra's internal completion command (shell completions work without db)
+			"__completeNoDesc", // Cobra's completion without descriptions (used by fish)
 			"bash",
 			"completion",
 			"doctor",
@@ -310,6 +400,7 @@ var rootCmd = &cobra.Command{
 			"prime",
 			"quickstart",
 			"repair",
+			"resolve-conflicts",
 			"setup",
 			"version",
 			"zsh",
@@ -334,6 +425,30 @@ var rootCmd = &cobra.Command{
 		// Also skip for --version flag on root command (cmdName would be "bd")
 		if v, _ := cmd.Flags().GetBool("version"); v {
 			return
+		}
+
+		// Signal orchestrator daemon about bd activity (best-effort, for exponential backoff)
+		// GH#1093: Moved after noDbCommands check to avoid git subprocesses for simple commands
+		defer signalOrchestratorActivity()
+
+		// Protect forks from accidentally committing upstream issue database
+		ensureForkProtection()
+
+		// Performance profiling setup
+		// When --profile is enabled, force direct mode to capture actual database operations
+		// rather than just RPC serialization/network overhead. This gives accurate profiles
+		// of the storage layer, query performance, and business logic.
+		if profileEnabled {
+			noDaemon = true
+			timestamp := time.Now().Format("20060102-150405")
+			if f, _ := os.Create(fmt.Sprintf("bd-profile-%s-%s.prof", cmd.Name(), timestamp)); f != nil {
+				profileFile = f
+				_ = pprof.StartCPUProfile(f)
+			}
+			if f, _ := os.Create(fmt.Sprintf("bd-trace-%s-%s.out", cmd.Name(), timestamp)); f != nil {
+				traceFile = f
+				_ = trace.Start(f)
+			}
 		}
 
 		// Auto-detect sandboxed environment (Phase 2 for GH #353)
@@ -376,15 +491,7 @@ var rootCmd = &cobra.Command{
 			}
 
 			// Set actor for audit trail
-			if actor == "" {
-				if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
-					actor = bdActor
-				} else if user := os.Getenv("USER"); user != "" {
-					actor = user
-				} else {
-					actor = "unknown"
-				}
-			}
+			actor = getActorWithGit()
 
 			// Skip daemon and SQLite initialization - we're in memory mode
 			return
@@ -418,15 +525,7 @@ var rootCmd = &cobra.Command{
 							os.Exit(1)
 						}
 						// Set actor for audit trail
-						if actor == "" {
-							if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
-								actor = bdActor
-							} else if user := os.Getenv("USER"); user != "" {
-								actor = user
-							} else {
-								actor = "unknown"
-							}
-						}
+						actor = getActorWithGit()
 						return
 					}
 				}
@@ -434,7 +533,26 @@ var rootCmd = &cobra.Command{
 				// Allow some commands to run without a database
 				// - import: auto-initializes database if missing
 				// - setup: creates editor integration files (no DB needed)
-				if cmd.Name() != "import" && cmd.Name() != "setup" {
+				// - config set/get for yaml-only keys: writes to config.yaml, not SQLite (GH#536)
+				isYamlOnlyConfigOp := false
+				if (cmd.Name() == "set" || cmd.Name() == "get") && cmd.Parent() != nil && cmd.Parent().Name() == "config" {
+					if len(args) > 0 && config.IsYamlOnlyKey(args[0]) {
+						isYamlOnlyConfigOp = true
+					}
+				}
+
+				// Allow read-only commands to auto-bootstrap from JSONL (GH#b09)
+				// This enables `bd --no-daemon show` after cold-start when DB is missing
+				canAutoBootstrap := false
+				if isReadOnlyCommand(cmd.Name()) && beadsDir != "" {
+					jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+					if _, err := os.Stat(jsonlPath); err == nil {
+						canAutoBootstrap = true
+						debug.Logf("cold-start bootstrap: JSONL exists, allowing auto-create for %s", cmd.Name())
+					}
+				}
+
+				if cmd.Name() != "import" && cmd.Name() != "setup" && !isYamlOnlyConfigOp && !canAutoBootstrap {
 					// No database found - provide context-aware error message
 					fmt.Fprintf(os.Stderr, "Error: no beads database found\n")
 
@@ -460,21 +578,24 @@ var rootCmd = &cobra.Command{
 					os.Exit(1)
 				}
 				// For import/setup commands, set default database path
-				dbPath = filepath.Join(".beads", beads.CanonicalDatabaseName)
+				// Invariant: dbPath must always be absolute for filepath.Rel() compatibility
+				// in daemon sync-branch code path. Use CanonicalizePath for OS-agnostic
+				// handling (symlinks, case normalization on macOS).
+				//
+				// IMPORTANT: Use FindBeadsDir() to get the correct .beads directory,
+				// which follows redirect files. Without this, a redirected .beads
+				// would create a local database instead of using the redirect target.
+				// (GH#bd-0qel)
+				targetBeadsDir := beads.FindBeadsDir()
+				if targetBeadsDir == "" {
+					targetBeadsDir = ".beads"
+				}
+				dbPath = utils.CanonicalizePath(filepath.Join(targetBeadsDir, beads.CanonicalDatabaseName))
 			}
 		}
 
 		// Set actor for audit trail
-		// Priority: --actor flag > BD_ACTOR env > USER env > "unknown"
-		if actor == "" {
-			if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
-				actor = bdActor
-			} else if user := os.Getenv("USER"); user != "" {
-				actor = user
-			} else {
-				actor = "unknown"
-			}
-		}
+		actor = getActorWithGit()
 
 		// Track bd version changes
 		// Best-effort tracking - failures are silent
@@ -498,6 +619,12 @@ var rootCmd = &cobra.Command{
 			noDaemon = true
 		}
 
+		// Restore should always run in direct mode. It performs git checkouts to read
+		// historical issue data, which could conflict with daemon operations.
+		if cmd.Name() == "restore" {
+			noDaemon = true
+		}
+
 		// Wisp operations auto-bypass daemon
 		// Wisps are ephemeral (Ephemeral=true) and never exported to JSONL,
 		// so daemon can't help anyway. This reduces friction in wisp workflows.
@@ -505,6 +632,17 @@ var rootCmd = &cobra.Command{
 			noDaemon = true
 			daemonStatus.FallbackReason = FallbackWispOperation
 			debug.Logf("wisp operation detected, using direct mode")
+		}
+
+		// Embedded Dolt is single-process-only; never use daemon/RPC.
+		// (Dolt server mode supports multi-process and won't trigger this.)
+		// This must be checked after dbPath is resolved.
+		if !noDaemon && singleProcessOnlyBackend() {
+			noDaemon = true
+			daemonStatus.AutoStartEnabled = false
+			daemonStatus.FallbackReason = FallbackSingleProcessOnly
+			daemonStatus.Detail = "backend is single-process-only (embedded dolt): daemon mode disabled; using direct mode"
+			debug.Logf("single-process backend detected, using direct mode")
 		}
 
 		// Try to connect to daemon first (unless --no-daemon flag is set or worktree safety check fails)
@@ -696,21 +834,64 @@ var rootCmd = &cobra.Command{
 
 		// Fall back to direct storage access
 		var err error
-		if useReadOnly {
-			// Read-only mode: prevents file modifications (GH#804)
-			store, err = sqlite.NewReadOnlyWithTimeout(rootCtx, dbPath, lockTimeout)
-			if err != nil {
+		var needsBootstrap bool // Track if DB needs initial import (GH#b09)
+		beadsDir := filepath.Dir(dbPath)
+
+		// Detect backend from metadata.json
+		backend := factory.GetBackendFromConfig(beadsDir)
+
+		// Create storage with appropriate options
+		opts := factory.Options{
+			ReadOnly:    useReadOnly,
+			LockTimeout: lockTimeout,
+		}
+
+		if backend == configfile.BackendDolt {
+			// Acquire process-level semaphore before opening dolt DB.
+			// This limits concurrent dolt access across ALL bd processes
+			// (gt, hooks, CLI) to prevent lock contention hangs.
+			sem, semErr := acquireProcessSemaphore(beadsDir)
+			if semErr != nil {
+				debug.Logf("process semaphore: failed to acquire: %v (proceeding without)", semErr)
+				// Non-fatal: proceed without semaphore rather than blocking all bd commands
+			} else {
+				processSem = sem
+			}
+
+			// For Dolt, use the dolt subdirectory
+			doltPath := filepath.Join(beadsDir, "dolt")
+
+			// Check if server mode is configured in metadata.json
+			cfg, cfgErr := configfile.Load(beadsDir)
+			if cfgErr == nil && cfg != nil && cfg.IsDoltServerMode() {
+				opts.ServerMode = true
+				opts.ServerHost = cfg.GetDoltServerHost()
+				opts.ServerPort = cfg.GetDoltServerPort()
+				if cfg.Database != "" {
+					opts.Database = cfg.GetDoltDatabase()
+				}
+			}
+
+			store, err = factory.NewWithOptions(rootCtx, backend, doltPath, opts)
+		} else {
+			// SQLite backend
+			store, err = factory.NewWithOptions(rootCtx, backend, dbPath, opts)
+			if err != nil && useReadOnly {
 				// If read-only fails (e.g., DB doesn't exist), fall back to read-write
 				// This handles the case where user runs "bd list" before "bd init"
 				debug.Logf("read-only open failed, falling back to read-write: %v", err)
-				store, err = sqlite.NewWithTimeout(rootCtx, dbPath, lockTimeout)
+				opts.ReadOnly = false
+				store, err = factory.NewWithOptions(rootCtx, backend, dbPath, opts)
+				needsBootstrap = true // New DB needs auto-import (GH#b09)
 			}
-		} else {
-			store, err = sqlite.NewWithTimeout(rootCtx, dbPath, lockTimeout)
 		}
+
+		// Track final read-only state for staleness checks (GH#1089)
+		// opts.ReadOnly may have changed if read-only open failed and fell back
+		storeIsReadOnly = opts.ReadOnly
+
 		if err != nil {
 			// Check for fresh clone scenario
-			beadsDir := filepath.Dir(dbPath)
 			if handleFreshCloneError(err, beadsDir) {
 				os.Exit(1)
 			}
@@ -749,7 +930,9 @@ var rootCmd = &cobra.Command{
 		// Skip for delete command to prevent resurrection of deleted issues
 		// Skip if sync --dry-run to avoid modifying DB in dry-run mode
 		// Skip for read-only commands - they can't write anyway (GH#804)
-		if cmd.Name() != "import" && cmd.Name() != "delete" && autoImportEnabled && !useReadOnly {
+		// Exception: allow auto-import for read-only commands that fell back to
+		// read-write mode due to missing DB (needsBootstrap) - fixes GH#b09
+		if cmd.Name() != "import" && cmd.Name() != "delete" && autoImportEnabled && (!useReadOnly || needsBootstrap) {
 			// Check if this is sync command with --dry-run flag
 			if cmd.Name() == "sync" {
 				if dryRun, _ := cmd.Flags().GetBool("dry-run"); dryRun {
@@ -826,6 +1009,45 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
+		// Dolt auto-commit: after a successful write command (and after final flush),
+		// create a Dolt commit so changes don't remain only in the working set.
+		if commandDidWrite.Load() && !commandDidExplicitDoltCommit {
+			if err := maybeAutoCommit(rootCtx, doltAutoCommitParams{Command: cmd.Name()}); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: dolt auto-commit failed: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		// Tip metadata auto-commit: if a tip was shown, create a separate Dolt commit for the
+		// tip_*_last_shown metadata updates. This may happen even for otherwise read-only commands.
+		if commandDidWriteTipMetadata && len(commandTipIDsShown) > 0 {
+			// Only applies when dolt auto-commit is enabled and backend is versioned (Dolt).
+			if mode, err := getDoltAutoCommitMode(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: dolt tip auto-commit failed: %v\n", err)
+				os.Exit(1)
+			} else if mode == doltAutoCommitOn {
+				// Apply tip metadata writes now (deferred in recordTipShown for Dolt).
+				for tipID := range commandTipIDsShown {
+					key := fmt.Sprintf("tip_%s_last_shown", tipID)
+					value := time.Now().Format(time.RFC3339)
+					if err := store.SetMetadata(rootCtx, key, value); err != nil {
+						fmt.Fprintf(os.Stderr, "Error: dolt tip auto-commit failed: %v\n", err)
+						os.Exit(1)
+					}
+				}
+
+				ids := make([]string, 0, len(commandTipIDsShown))
+				for tipID := range commandTipIDsShown {
+					ids = append(ids, tipID)
+				}
+				msg := formatDoltAutoCommitMessage("tip", getActor(), ids)
+				if err := maybeAutoCommit(rootCtx, doltAutoCommitParams{Command: "tip", MessageOverride: msg}); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: dolt tip auto-commit failed: %v\n", err)
+					os.Exit(1)
+				}
+			}
+		}
+
 		// Signal that store is closing (prevents background flush from accessing closed store)
 		storeMutex.Lock()
 		storeActive = false
@@ -834,6 +1056,13 @@ var rootCmd = &cobra.Command{
 		if store != nil {
 			_ = store.Close()
 		}
+
+		// Release process-level semaphore after store is closed
+		if processSem != nil {
+			processSem.Release()
+			processSem = nil
+		}
+
 		if profileFile != nil {
 			pprof.StopCPUProfile()
 			_ = profileFile.Close()

@@ -4,11 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/factory"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/util"
@@ -23,8 +24,18 @@ var readyCmd = &cobra.Command{
 Use --mol to filter to a specific molecule's steps:
   bd ready --mol bd-patrol   # Show ready steps within molecule
 
+Use --gated to find molecules ready for gate-resume dispatch:
+  bd ready --gated           # Find molecules where a gate closed
+
 This is useful for agents executing molecules to see which steps can run next.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Handle --gated flag (gate-resume discovery)
+		gated, _ := cmd.Flags().GetBool("gated")
+		if gated {
+			runMolReadyGated(cmd, args)
+			return
+		}
+
 		// Handle molecule-specific ready query
 		molID, _ := cmd.Flags().GetString("mol")
 		if molID != "" {
@@ -39,9 +50,11 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		labels, _ := cmd.Flags().GetStringSlice("label")
 		labelsAny, _ := cmd.Flags().GetStringSlice("label-any")
 		issueType, _ := cmd.Flags().GetString("type")
+		issueType = util.NormalizeIssueType(issueType) // Expand aliases (mr→merge-request, etc.)
 		parentID, _ := cmd.Flags().GetString("parent")
 		molTypeStr, _ := cmd.Flags().GetString("mol-type")
 		prettyFormat, _ := cmd.Flags().GetBool("pretty")
+		includeDeferred, _ := cmd.Flags().GetBool("include-deferred")
 		var molType *types.MolType
 		if molTypeStr != "" {
 			mt := types.MolType(molTypeStr)
@@ -66,12 +79,13 @@ This is useful for agents executing molecules to see which steps can run next.`,
 
 		filter := types.WorkFilter{
 			// Leave Status empty to get both 'open' and 'in_progress'
-			Type:       issueType,
-			Limit:      limit,
-			Unassigned: unassigned,
-			SortPolicy: types.SortPolicy(sortPolicy),
-			Labels:     labels,
-			LabelsAny:  labelsAny,
+			Type:            issueType,
+			Limit:           limit,
+			Unassigned:      unassigned,
+			SortPolicy:      types.SortPolicy(sortPolicy),
+			Labels:          labels,
+			LabelsAny:       labelsAny,
+			IncludeDeferred: includeDeferred, // GH#820: respect --include-deferred flag
 		}
 		// Use Changed() to properly handle P0 (priority=0)
 		if cmd.Flags().Changed("priority") {
@@ -95,15 +109,16 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		// If daemon is running, use RPC
 		if daemonClient != nil {
 			readyArgs := &rpc.ReadyArgs{
-				Assignee:   assignee,
-				Unassigned: unassigned,
-				Type:       issueType,
-				Limit:      limit,
-				SortPolicy: sortPolicy,
-				Labels:     labels,
-				LabelsAny:  labelsAny,
-				ParentID:   parentID,
-				MolType:    molTypeStr,
+				Assignee:        assignee,
+				Unassigned:      unassigned,
+				Type:            issueType,
+				Limit:           limit,
+				SortPolicy:      sortPolicy,
+				Labels:          labels,
+				LabelsAny:       labelsAny,
+				ParentID:        parentID,
+				MolType:         molTypeStr,
+				IncludeDeferred: includeDeferred, // GH#820
 			}
 			if cmd.Flags().Changed("priority") {
 				priority, _ := cmd.Flags().GetInt("priority")
@@ -201,7 +216,19 @@ This is useful for agents executing molecules to see which steps can run next.`,
 			if issues == nil {
 				issues = []*types.Issue{}
 			}
-			outputJSON(issues)
+			issueIDs := make([]string, len(issues))
+			for i, issue := range issues {
+				issueIDs[i] = issue.ID
+			}
+			commentCounts, _ := store.GetCommentCounts(ctx, issueIDs)
+			issuesWithCounts := make([]*types.IssueWithCounts, len(issues))
+			for i, issue := range issues {
+				issuesWithCounts[i] = &types.IssueWithCounts{
+					Issue:        issue,
+					CommentCount: commentCounts[issue.ID],
+				}
+			}
+			outputJSON(issuesWithCounts)
 			return
 		}
 		// Show upgrade notification if needed
@@ -252,10 +279,11 @@ var blockedCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		// Use global jsonOutput set by PersistentPreRun (respects config.yaml + env vars)
 		// If daemon is running but doesn't support this command, use direct storage
+		// Use factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
 		ctx := rootCtx
 		if daemonClient != nil && store == nil {
 			var err error
-			store, err = sqlite.New(ctx, dbPath)
+			store, err = factory.NewFromConfig(ctx, filepath.Dir(dbPath))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to open database: %v\n", err)
 				os.Exit(1)
@@ -441,11 +469,13 @@ func init() {
 	readyCmd.Flags().StringP("sort", "s", "hybrid", "Sort policy: hybrid (default), priority, oldest")
 	readyCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL). Can combine with --label-any")
 	readyCmd.Flags().StringSlice("label-any", []string{}, "Filter by labels (OR: must have AT LEAST ONE). Can combine with --label")
-	readyCmd.Flags().StringP("type", "t", "", "Filter by issue type (task, bug, feature, epic, merge-request)")
+	readyCmd.Flags().StringP("type", "t", "", "Filter by issue type (task, bug, feature, epic, merge-request). Aliases: mr→merge-request, feat→feature, mol→molecule")
 	readyCmd.Flags().String("mol", "", "Filter to steps within a specific molecule")
 	readyCmd.Flags().String("parent", "", "Filter to descendants of this bead/epic")
 	readyCmd.Flags().String("mol-type", "", "Filter by molecule type: swarm, patrol, or work")
 	readyCmd.Flags().Bool("pretty", false, "Display issues in a tree format with status/priority symbols")
+	readyCmd.Flags().Bool("include-deferred", false, "Include issues with future defer_until timestamps")
+	readyCmd.Flags().Bool("gated", false, "Find molecules ready for gate-resume dispatch")
 	rootCmd.AddCommand(readyCmd)
 	blockedCmd.Flags().String("parent", "", "Filter to descendants of this bead/epic")
 	rootCmd.AddCommand(blockedCmd)

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 
@@ -372,7 +371,7 @@ func removeIssueFromJSONL(issueID string) error {
 		if os.IsNotExist(err) {
 			return nil // No file, nothing to clean
 		}
-		return fmt.Errorf("failed to open JSONL: %w", err)
+		return fmt.Errorf("failed to open storage file: %w", err)
 	}
 	var issues []*types.Issue
 	scanner := bufio.NewScanner(f)
@@ -392,10 +391,10 @@ func removeIssueFromJSONL(issueID string) error {
 	}
 	if err := scanner.Err(); err != nil {
 		_ = f.Close()
-		return fmt.Errorf("failed to read JSONL: %w", err)
+		return fmt.Errorf("failed to read storage file: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		return fmt.Errorf("failed to close JSONL: %w", err)
+		return fmt.Errorf("failed to close storage file: %w", err)
 	}
 	// Write to temp file atomically
 	temp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
@@ -802,30 +801,6 @@ func uniqueStrings(slice []string) []string {
 	return result
 }
 
-// getActorWithGit returns the actor for audit trail with git config fallback.
-// Priority: global actor var (from --actor flag or BD_ACTOR env) > git config user.name > $USER > "unknown"
-func getActorWithGit() string {
-	// If actor is already set (from flag or env), use it
-	if actor != "" && actor != "unknown" {
-		return actor
-	}
-
-	// Try git config user.name
-	cmd := exec.Command("git", "config", "user.name")
-	if output, err := cmd.Output(); err == nil {
-		if gitUser := strings.TrimSpace(string(output)); gitUser != "" {
-			return gitUser
-		}
-	}
-
-	// Fall back to USER env
-	if user := os.Getenv("USER"); user != "" {
-		return user
-	}
-
-	return "unknown"
-}
-
 func init() {
 	deleteCmd.Flags().BoolP("force", "f", false, "Actually delete (without this flag, shows preview)")
 	deleteCmd.Flags().String("from-file", "", "Read issue IDs from file (one per line)")
@@ -833,5 +808,6 @@ func init() {
 	deleteCmd.Flags().Bool("cascade", false, "Recursively delete all dependent issues")
 	deleteCmd.Flags().Bool("hard", false, "Permanently delete (skip tombstone, cannot be recovered via sync)")
 	deleteCmd.Flags().String("reason", "", "Reason for deletion (stored in tombstone for audit trail)")
+	deleteCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(deleteCmd)
 }

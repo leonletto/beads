@@ -21,13 +21,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// readFromGitRef reads file content from a git ref (branch or commit).
+// readFromGitRef reads file content from a git ref (branch or commit) in the beads repo.
 // Returns the raw bytes from git show <ref>:<path>.
 // The filePath is automatically converted to forward slashes for Windows compatibility.
 // Returns nil, err if the git command fails (e.g., file not found in ref).
+// GH#1110: Now uses RepoContext to ensure git commands run in beads repo.
 func readFromGitRef(filePath, gitRef string) ([]byte, error) {
 	gitPath := filepath.ToSlash(filePath)
-	cmd := exec.Command("git", "show", fmt.Sprintf("%s:%s", gitRef, gitPath)) // #nosec G204 - git command with safe args
+	var cmd *exec.Cmd
+	if rc, err := beads.GetRepoContext(); err == nil {
+		cmd = rc.GitCmd(context.Background(), "show", fmt.Sprintf("%s:%s", gitRef, gitPath))
+	} else {
+		// Fallback to CWD for tests or repos without beads
+		cmd = exec.Command("git", "show", fmt.Sprintf("%s:%s", gitRef, gitPath)) // #nosec G204 - git command with safe args
+	}
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read from git: %w", err)
@@ -41,6 +48,13 @@ func readFromGitRef(filePath, gitRef string) ([]byte, error) {
 func checkAndAutoImport(ctx context.Context, store storage.Storage) bool {
 	// Don't auto-import if auto-import is explicitly disabled
 	if noAutoImport {
+		return false
+	}
+
+	// Skip JSONL import in dolt-native mode — there is no JSONL to import,
+	// and GetStatistics can panic with a nil pointer when the Dolt backend
+	// connection is not fully initialized.
+	if !ShouldImportJSONL(ctx, store) {
 		return false
 	}
 
@@ -118,6 +132,13 @@ func checkGitForIssues() (int, string, string) {
 		return 0, "", ""
 	}
 
+	// GH#896: Reject beadsDir that is outside the git repository.
+	// This prevents bd init from inheriting issues from a parent hub
+	// when initializing a new project in a subdirectory.
+	if strings.HasPrefix(relBeads, "..") {
+		return 0, "", ""
+	}
+
 	// Determine which branch to read from (bd-0is fix)
 	// If sync-branch is configured in local config.yaml, use it; otherwise fall back to HEAD
 	// We read sync-branch directly from local config file rather than using cached global config
@@ -128,8 +149,14 @@ func checkGitForIssues() (int, string, string) {
 		// Check if the sync branch exists (locally or on remote)
 		// Try origin/<branch> first (more likely to exist in fresh clones),
 		// then local <branch>
+		// GH#1110: Use RepoContext to ensure we check the beads repo
 		for _, ref := range []string{"origin/" + syncBranch, syncBranch} {
-			cmd := exec.Command("git", "rev-parse", "--verify", "--quiet", ref) // #nosec G204
+			var cmd *exec.Cmd
+			if rc, err := beads.GetRepoContext(); err == nil {
+				cmd = rc.GitCmd(context.Background(), "rev-parse", "--verify", "--quiet", ref)
+			} else {
+				cmd = exec.Command("git", "rev-parse", "--verify", "--quiet", ref) // #nosec G204
+			}
 			if err := cmd.Run(); err == nil {
 				gitRef = ref
 				break

@@ -18,7 +18,7 @@ import (
 func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, error) {
 	whereClauses := []string{
 		"i.pinned = 0",                             // Exclude pinned issues
-		"(i.ephemeral = 0 OR i.ephemeral IS NULL)", // Exclude wisps
+		"(i.ephemeral = 0 OR i.ephemeral IS NULL)", // Exclude wisps by ephemeral flag
 	}
 	args := []interface{}{}
 
@@ -42,7 +42,19 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 		// - molecule: workflow containers
 		// - message: mail/communication items
 		// - agent: identity/state tracking beads
-		whereClauses = append(whereClauses, "i.issue_type NOT IN ('merge-request', 'gate', 'molecule', 'message', 'agent')")
+		// - role: agent role definitions (reference metadata)
+		// - rig: rig identity beads (reference metadata)
+		whereClauses = append(whereClauses, "i.issue_type NOT IN ('merge-request', 'gate', 'molecule', 'message', 'agent', 'role', 'rig')")
+		// Exclude IDs matching configured patterns
+		// Default patterns: -mol- (molecule steps), -wisp- (ephemeral wisps)
+		// Configure with: bd config set ready.exclude_id_patterns "-mol-,-wisp-"
+		// Use --type=task to explicitly include them, or IncludeMolSteps for internal callers
+		if !filter.IncludeMolSteps {
+			patterns := s.getExcludeIDPatterns(ctx)
+			for _, pattern := range patterns {
+				whereClauses = append(whereClauses, "i.id NOT LIKE '%"+pattern+"%'")
+			}
+		}
 	}
 
 	if filter.Priority != nil {
@@ -113,6 +125,13 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 		args = append(args, string(*filter.MolType))
 	}
 
+	// Time-based deferral filtering (GH#820)
+	// By default, exclude issues where defer_until is in the future.
+	// If IncludeDeferred is true, skip this filter to show deferred issues.
+	if !filter.IncludeDeferred {
+		whereClauses = append(whereClauses, "(i.defer_until IS NULL OR datetime(i.defer_until) <= datetime('now'))")
+	}
+
 	// Build WHERE clause properly
 	whereSQL := strings.Join(whereClauses, " AND ")
 
@@ -145,10 +164,12 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 	query := fmt.Sprintf(`
 		SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
 		i.status, i.priority, i.issue_type, i.assignee, i.estimated_minutes,
-		i.created_at, i.created_by, i.updated_at, i.closed_at, i.external_ref, i.source_repo, i.close_reason,
+		i.created_at, i.created_by, i.owner, i.updated_at, i.closed_at, i.external_ref, i.source_repo, i.close_reason,
 		i.deleted_at, i.deleted_by, i.delete_reason, i.original_type,
-		i.sender, i.ephemeral, i.pinned, i.is_template,
-		i.await_type, i.await_id, i.timeout_ns, i.waiters
+		i.sender, i.ephemeral, i.pinned, i.is_template, i.crystallizes,
+		i.await_type, i.await_id, i.timeout_ns, i.waiters,
+		i.hook_bead, i.role_bead, i.agent_state, i.last_activity, i.role_type, i.rig, i.mol_type,
+		i.due_at, i.defer_until, i.metadata
 		FROM issues i
 		WHERE %s
 		AND NOT EXISTS (
@@ -184,6 +205,10 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 // filterByExternalDeps removes issues that have unsatisfied external dependencies.
 // External deps have format: external:<project>:<capability>
 // They are satisfied when the target project has a closed issue with provides:<capability> label.
+//
+// Optimization: Collects all unique external refs across all issues, then checks
+// them in batch (one DB open per external project) rather than checking each
+// ref individually. This avoids O(N) DB opens when issues share external deps.
 func (s *SQLiteStorage) filterByExternalDeps(ctx context.Context, issues []*types.Issue) ([]*types.Issue, error) {
 	if len(issues) == 0 {
 		return issues, nil
@@ -206,12 +231,26 @@ func (s *SQLiteStorage) filterByExternalDeps(ctx context.Context, issues []*type
 		return issues, nil
 	}
 
-	// Check each external dep and build set of blocked issue IDs
+	// Collect all unique external refs across all issues
+	uniqueRefs := make(map[string]bool)
+	for _, deps := range externalDeps {
+		for _, dep := range deps {
+			uniqueRefs[dep] = true
+		}
+	}
+
+	// Check all refs in batch (grouped by project internally)
+	refList := make([]string, 0, len(uniqueRefs))
+	for ref := range uniqueRefs {
+		refList = append(refList, ref)
+	}
+	statuses := CheckExternalDeps(ctx, refList)
+
+	// Build set of blocked issue IDs using batch results
 	blockedIssues := make(map[string]bool)
 	for issueID, deps := range externalDeps {
 		for _, dep := range deps {
-			status := CheckExternalDep(ctx, dep)
-			if !status.Satisfied {
+			if status, ok := statuses[dep]; ok && !status.Satisfied {
 				blockedIssues[issueID] = true
 				break // One unsatisfied dep is enough to block
 			}
@@ -316,6 +355,8 @@ func (s *SQLiteStorage) GetStaleIssues(ctx context.Context, filter types.StaleFi
 	var issues []*types.Issue
 	for rows.Next() {
 		var issue types.Issue
+		var createdAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
+		var updatedAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
 		var closedAt sql.NullTime
 		var estimatedMinutes sql.NullInt64
 		var assignee sql.NullString
@@ -348,7 +389,7 @@ func (s *SQLiteStorage) GetStaleIssues(ctx context.Context, filter types.StaleFi
 			&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
 			&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
 			&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-			&issue.CreatedAt, &issue.UpdatedAt, &closedAt, &externalRef, &sourceRepo,
+			&createdAtStr, &updatedAtStr, &closedAt, &externalRef, &sourceRepo,
 			&compactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &closeReason,
 			&deletedAt, &deletedBy, &deleteReason, &originalType,
 			&sender, &ephemeral, &pinned, &isTemplate,
@@ -356,6 +397,14 @@ func (s *SQLiteStorage) GetStaleIssues(ctx context.Context, filter types.StaleFi
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan stale issue: %w", err)
+		}
+
+		// Parse timestamp strings (TEXT columns require manual parsing)
+		if createdAtStr.Valid {
+			issue.CreatedAt = parseTimeString(createdAtStr.String)
+		}
+		if updatedAtStr.Valid {
+			issue.UpdatedAt = parseTimeString(updatedAtStr.String)
 		}
 
 		if contentHash.Valid {
@@ -534,6 +583,8 @@ func (s *SQLiteStorage) GetBlockedIssues(ctx context.Context, filter types.WorkF
 	var blocked []*types.BlockedIssue
 	for rows.Next() {
 		var issue types.BlockedIssue
+		var createdAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
+		var updatedAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
 		var closedAt sql.NullTime
 		var estimatedMinutes sql.NullInt64
 		var assignee sql.NullString
@@ -545,11 +596,19 @@ func (s *SQLiteStorage) GetBlockedIssues(ctx context.Context, filter types.WorkF
 			&issue.ID, &issue.Title, &issue.Description, &issue.Design,
 			&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
 			&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-			&issue.CreatedAt, &issue.CreatedBy, &issue.UpdatedAt, &closedAt, &externalRef, &sourceRepo, &issue.BlockedByCount,
+			&createdAtStr, &issue.CreatedBy, &updatedAtStr, &closedAt, &externalRef, &sourceRepo, &issue.BlockedByCount,
 			&blockerIDsStr,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan blocked issue: %w", err)
+		}
+
+		// Parse timestamp strings (TEXT columns require manual parsing)
+		if createdAtStr.Valid {
+			issue.CreatedAt = parseTimeString(createdAtStr.String)
+		}
+		if updatedAtStr.Valid {
+			issue.UpdatedAt = parseTimeString(updatedAtStr.String)
 		}
 
 		if closedAt.Valid {
@@ -655,6 +714,52 @@ func filterBlockedByExternalDeps(ctx context.Context, blocked []*types.BlockedIs
 	return result
 }
 
+// IsBlocked checks if an issue is blocked by open dependencies (GH#962).
+// Returns true if the issue is in the blocked_issues_cache, along with a list
+// of issue IDs that are blocking it.
+// This is used to prevent closing issues that still have open blockers.
+func (s *SQLiteStorage) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
+	// First check if the issue is in the blocked cache
+	var inCache bool
+	err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM blocked_issues_cache WHERE issue_id = ?)
+	`, issueID).Scan(&inCache)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to check blocked status: %w", err)
+	}
+
+	if !inCache {
+		return false, nil, nil
+	}
+
+	// Get the blocking issue IDs
+	// We query dependencies for 'blocks' type where the blocker is still open
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT d.depends_on_id
+		FROM dependencies d
+		JOIN issues blocker ON d.depends_on_id = blocker.id
+		WHERE d.issue_id = ?
+		  AND d.type = 'blocks'
+		  AND blocker.status IN ('open', 'in_progress', 'blocked', 'deferred', 'hooked')
+		ORDER BY blocker.priority ASC
+	`, issueID)
+	if err != nil {
+		return true, nil, fmt.Errorf("failed to get blockers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var blockers []string
+	for rows.Next() {
+		var blockerID string
+		if err := rows.Scan(&blockerID); err != nil {
+			return true, nil, fmt.Errorf("failed to scan blocker ID: %w", err)
+		}
+		blockers = append(blockers, blockerID)
+	}
+
+	return true, blockers, rows.Err()
+}
+
 // GetNewlyUnblockedByClose returns issues that became unblocked when the given issue was closed.
 // This is used by the --suggest-next flag on bd close to show what work is now available.
 // An issue is "newly unblocked" if:
@@ -673,10 +778,12 @@ func (s *SQLiteStorage) GetNewlyUnblockedByClose(ctx context.Context, closedIssu
 	query := `
 		SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
 		       i.status, i.priority, i.issue_type, i.assignee, i.estimated_minutes,
-		       i.created_at, i.created_by, i.updated_at, i.closed_at, i.external_ref, i.source_repo, i.close_reason,
+		       i.created_at, i.created_by, i.owner, i.updated_at, i.closed_at, i.external_ref, i.source_repo, i.close_reason,
 		       i.deleted_at, i.deleted_by, i.delete_reason, i.original_type,
-		       i.sender, i.ephemeral, i.pinned, i.is_template,
-		       i.await_type, i.await_id, i.timeout_ns, i.waiters
+		       i.sender, i.ephemeral, i.pinned, i.is_template, i.crystallizes,
+		       i.await_type, i.await_id, i.timeout_ns, i.waiters,
+		       i.hook_bead, i.role_bead, i.agent_state, i.last_activity, i.role_type, i.rig, i.mol_type,
+		       i.due_at, i.defer_until, i.metadata
 		FROM issues i
 		JOIN dependencies d ON i.id = d.issue_id
 		WHERE d.depends_on_id = ?
@@ -725,4 +832,36 @@ func buildOrderByClause(policy types.SortPolicy) string {
 			END ASC,
 			i.created_at ASC`
 	}
+}
+
+// ExcludeIDPatternsConfigKey is the config key for ID exclusion patterns in GetReadyWork
+const ExcludeIDPatternsConfigKey = "ready.exclude_id_patterns"
+
+// DefaultExcludeIDPatterns are the default patterns to exclude from GetReadyWork
+// These exclude molecule steps (-mol-) and wisps (-wisp-) which are internal workflow items
+var DefaultExcludeIDPatterns = []string{"-mol-", "-wisp-"}
+
+// getExcludeIDPatterns returns the ID patterns to exclude from GetReadyWork.
+// Reads from ready.exclude_id_patterns config, defaults to DefaultExcludeIDPatterns.
+// Config format: comma-separated patterns, e.g., "-mol-,-wisp-"
+func (s *SQLiteStorage) getExcludeIDPatterns(ctx context.Context) []string {
+	value, err := s.GetConfig(ctx, ExcludeIDPatternsConfigKey)
+	if err != nil || value == "" {
+		return DefaultExcludeIDPatterns
+	}
+
+	// Parse comma-separated patterns
+	parts := strings.Split(value, ",")
+	patterns := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			patterns = append(patterns, p)
+		}
+	}
+
+	if len(patterns) == 0 {
+		return DefaultExcludeIDPatterns
+	}
+	return patterns
 }

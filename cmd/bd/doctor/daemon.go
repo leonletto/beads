@@ -1,12 +1,18 @@
 package doctor
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/steveyegge/beads/internal/daemon"
+	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/storage/factory"
+	"github.com/steveyegge/beads/internal/syncbranch"
 )
 
 // CheckDaemonStatus checks the health of the daemon for a workspace.
@@ -121,4 +127,259 @@ func CheckVersionMismatch(db *sql.DB, cliVersion string) string {
 	}
 
 	return ""
+}
+
+// CheckGitSyncSetup checks if git repository and sync-branch are configured for daemon sync.
+// This is informational - beads works fine without git sync, but users may want to enable it.
+func CheckGitSyncSetup(path string) DoctorCheck {
+	// Check if we're in a git repository
+	_, err := git.GetGitDir()
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Git Sync Setup",
+			Status:   StatusWarning,
+			Message:  "No git repository (background sync unavailable)",
+			Detail:   "The daemon requires a git repository for background sync. Without it, beads runs in direct mode.",
+			Fix:      "Run 'git init' to enable background sync",
+			Category: CategoryRuntime,
+		}
+	}
+
+	// Git repo exists - check if sync-branch is configured
+	if !syncbranch.IsConfigured() {
+		return DoctorCheck{
+			Name:     "Git Sync Setup",
+			Status:   StatusOK,
+			Message:  "Git repository detected (sync-branch not configured)",
+			Detail:   "Beads commits directly to current branch. For team collaboration or to keep beads changes isolated, consider using a sync-branch.",
+			Fix:      "Run 'bd config set sync.branch beads-sync' to use a dedicated branch for beads metadata",
+			Category: CategoryRuntime,
+		}
+	}
+
+	return DoctorCheck{
+		Name:     "Git Sync Setup",
+		Status:   StatusOK,
+		Message:  "Git repository and sync-branch configured",
+		Category: CategoryRuntime,
+	}
+}
+
+// CheckDaemonAutoSync checks if daemon has auto-commit/auto-push enabled when
+// sync-branch is configured. Missing auto-sync slows down agent workflows.
+func CheckDaemonAutoSync(path string) DoctorCheck {
+	_, beadsDir := getBackendAndBeadsDir(path)
+	socketPath := filepath.Join(beadsDir, "bd.sock")
+
+	// Check if daemon is running
+	if _, err := os.Stat(socketPath); os.IsNotExist(err) {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusOK,
+			Message: "Daemon not running (will use defaults on next start)",
+		}
+	}
+
+	// Check if sync-branch is configured
+	ctx := context.Background()
+	store, err := factory.NewFromConfigWithOptions(ctx, beadsDir, factory.Options{ReadOnly: true})
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusOK,
+			Message: "Could not check config (database unavailable)",
+		}
+	}
+	defer func() { _ = store.Close() }()
+
+	syncBranch, _ := store.GetConfig(ctx, "sync.branch")
+	if syncBranch == "" {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusOK,
+			Message: "No sync-branch configured (auto-sync not applicable)",
+		}
+	}
+
+	// Sync-branch is configured - check daemon's auto-commit/auto-push status
+	client, err := rpc.TryConnect(socketPath)
+	if err != nil || client == nil {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusWarning,
+			Message: "Could not connect to daemon to check auto-sync status",
+		}
+	}
+	defer func() { _ = client.Close() }()
+
+	status, err := client.Status()
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusWarning,
+			Message: "Could not get daemon status",
+			Detail:  err.Error(),
+		}
+	}
+
+	if !status.AutoCommit || !status.AutoPush {
+		var missing []string
+		if !status.AutoCommit {
+			missing = append(missing, "auto-commit")
+		}
+		if !status.AutoPush {
+			missing = append(missing, "auto-push")
+		}
+		return DoctorCheck{
+			Name:    "Daemon Auto-Sync",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Daemon running without %v (slows agent workflows)", missing),
+			Detail:  "With sync-branch configured, auto-commit and auto-push should be enabled",
+			Fix:     "Restart daemon: bd daemon stop && bd daemon start",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Daemon Auto-Sync",
+		Status:  StatusOK,
+		Message: "Auto-commit and auto-push enabled",
+	}
+}
+
+// CheckLegacyDaemonConfig checks for deprecated daemon config options and
+// encourages migration to the unified daemon.auto-sync setting.
+func CheckLegacyDaemonConfig(path string) DoctorCheck {
+	_, beadsDir := getBackendAndBeadsDir(path)
+
+	ctx := context.Background()
+	store, err := factory.NewFromConfigWithOptions(ctx, beadsDir, factory.Options{ReadOnly: true})
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Daemon Config",
+			Status:  StatusOK,
+			Message: "Could not check config (database unavailable)",
+		}
+	}
+	defer func() { _ = store.Close() }()
+
+	// Check for deprecated individual settings
+	var legacySettings []string
+
+	if val, _ := store.GetConfig(ctx, "daemon.auto_commit"); val != "" {
+		legacySettings = append(legacySettings, "daemon.auto_commit")
+	}
+	if val, _ := store.GetConfig(ctx, "daemon.auto_push"); val != "" {
+		legacySettings = append(legacySettings, "daemon.auto_push")
+	}
+
+	if len(legacySettings) > 0 {
+		return DoctorCheck{
+			Name:    "Daemon Config",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Deprecated config options found: %v", legacySettings),
+			Detail:  "These options still work but are deprecated. Use daemon.auto-sync for read/write mode or daemon.auto-pull for read-only mode.",
+			Fix:     "Run: bd config delete daemon.auto_commit && bd config delete daemon.auto_push && bd config set daemon.auto-sync true",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Daemon Config",
+		Status:  StatusOK,
+		Message: "Using current config format",
+	}
+}
+
+// CheckHydratedRepoDaemons checks if daemons are running for all repos
+// configured in repos.additional. Without running daemons, JSONL files won't
+// be kept updated, causing multi-repo hydration to become stale (bd-fix-routing).
+func CheckHydratedRepoDaemons(path string) DoctorCheck {
+	beadsDir := filepath.Join(path, ".beads")
+
+	ctx := context.Background()
+	// Use factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
+	store, err := factory.NewFromConfig(ctx, beadsDir)
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Hydrated Repo Daemons",
+			Status:  StatusOK,
+			Message: "Could not check config (database unavailable)",
+		}
+	}
+	defer func() { _ = store.Close() }()
+
+	// Get repos.additional from config
+	additionalReposStr, _ := store.GetConfig(ctx, "repos.additional")
+	if additionalReposStr == "" {
+		return DoctorCheck{
+			Name:    "Hydrated Repo Daemons",
+			Status:  StatusOK,
+			Message: "No additional repos configured (N/A)",
+		}
+	}
+
+	// Parse additional repos (stored as JSON array string)
+	var additionalRepos []string
+	if err := unmarshalConfigValue(additionalReposStr, &additionalRepos); err != nil {
+		return DoctorCheck{
+			Name:    "Hydrated Repo Daemons",
+			Status:  StatusWarning,
+			Message: "Could not parse repos.additional config",
+			Detail:  err.Error(),
+		}
+	}
+
+	if len(additionalRepos) == 0 {
+		return DoctorCheck{
+			Name:    "Hydrated Repo Daemons",
+			Status:  StatusOK,
+			Message: "No additional repos configured (N/A)",
+		}
+	}
+
+	// Check each additional repo for running daemon
+	var missingDaemons []string
+	for _, repoPath := range additionalRepos {
+		// Expand ~ to home directory
+		expandedPath := expandPath(repoPath)
+
+		// Construct socket path
+		socketPath := filepath.Join(expandedPath, ".beads", "bd.sock")
+
+		// Try to connect to daemon
+		client, err := rpc.TryConnect(socketPath)
+		if err == nil && client != nil {
+			_ = client.Close()
+			// Daemon is running, all good
+		} else {
+			// No daemon running
+			missingDaemons = append(missingDaemons, repoPath)
+		}
+	}
+
+	if len(missingDaemons) > 0 {
+		return DoctorCheck{
+			Name:    "Hydrated Repo Daemons",
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Daemons not running in %d hydrated repo(s)", len(missingDaemons)),
+			Detail:  fmt.Sprintf("Missing daemons in: %v", missingDaemons),
+			Fix:     "For each repo, run: cd <repo> && bd daemon start --local",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Hydrated Repo Daemons",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("All %d hydrated repo(s) have running daemons", len(additionalRepos)),
+	}
+}
+
+// unmarshalConfigValue unmarshals a JSON config value
+func unmarshalConfigValue(value string, target interface{}) error {
+	// Config values are stored as JSON
+	if value == "" {
+		return nil
+	}
+
+	// Unmarshal JSON into target
+	return json.Unmarshal([]byte(value), target)
 }

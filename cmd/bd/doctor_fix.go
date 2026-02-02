@@ -183,6 +183,7 @@ func applyFixList(path string, fixes []doctorCheck) {
 	// Rough dependency chain:
 	// permissions/daemon cleanup → config sanity → DB integrity/migrations → DB↔JSONL sync.
 	order := []string{
+		"Lock Files",
 		"Permissions",
 		"Daemon Health",
 		"Database Config",
@@ -192,6 +193,7 @@ func applyFixList(path string, fixes []doctorCheck) {
 		"Schema Compatibility",
 		"JSONL Integrity",
 		"DB-JSONL Sync",
+		"Sync Divergence",
 	}
 	priority := make(map[string]int, len(order))
 	for i, name := range order {
@@ -227,12 +229,16 @@ func applyFixList(path string, fixes []doctorCheck) {
 			err = doctor.FixGitignore()
 		case "Redirect Tracking":
 			err = doctor.FixRedirectTracking()
+		case "Last-Touched Tracking":
+			err = doctor.FixLastTouchedTracking()
 		case "Git Hooks":
 			err = fix.GitHooks(path)
 		case "Daemon Health":
 			err = fix.Daemon(path)
 		case "DB-JSONL Sync":
 			err = fix.DBJSONLSync(path)
+		case "Sync Divergence":
+			err = fix.SyncDivergence(path)
 		case "Permissions":
 			err = fix.Permissions(path)
 		case "Database":
@@ -251,6 +257,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 			// No auto-fix: sync-branch should be added to config.yaml (version controlled)
 			fmt.Printf("  ⚠ Add 'sync-branch: beads-sync' to .beads/config.yaml\n")
 			continue
+		case "Sync Branch Gitignore":
+			err = doctor.FixSyncBranchGitignore()
 		case "Database Config":
 			err = fix.DatabaseConfig(path)
 		case "JSONL Config":
@@ -306,6 +314,12 @@ func applyFixList(path string, fixes []doctorCheck) {
 			// No auto-fix: pruning deletes data, must be user-controlled
 			fmt.Printf("  ⚠ Run 'bd cleanup --older-than 90' to prune old closed issues\n")
 			continue
+		case "Legacy MQ Files":
+			err = doctor.FixStaleMQFiles(path)
+		case "Patrol Pollution":
+			err = fix.PatrolPollution(path)
+		case "Lock Files":
+			err = fix.StaleLockFiles(path)
 		default:
 			fmt.Printf("  ⚠ No automatic fix available for %s\n", check.Name)
 			fmt.Printf("  Manual fix: %s\n", check.Fix)

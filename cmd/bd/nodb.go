@@ -47,7 +47,7 @@ func initializeNoDbMode() error {
 	if _, err := os.Stat(jsonlPath); err == nil {
 		issues, err := loadIssuesFromJSONL(jsonlPath)
 		if err != nil {
-			return fmt.Errorf("failed to load issues from %s: %w", jsonlPath, err)
+			return fmt.Errorf("failed to load issues: %w", err)
 		}
 
 		if err := memStore.LoadFromIssues(issues); err != nil {
@@ -73,10 +73,11 @@ func initializeNoDbMode() error {
 	debug.Logf("using prefix '%s'", prefix)
 
 	// Set global store and mark as active (fixes bd comment --no-db)
-	storeMutex.Lock()
-	store = memStore
-	storeActive = true
-	storeMutex.Unlock()
+	// GH#897: Use accessor functions to also set cmdCtx fields, not just globals
+	lockStore()
+	setStore(memStore)
+	setStoreActive(true)
+	unlockStore()
 	return nil
 }
 

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -21,14 +22,14 @@ type MemoryStorage struct {
 	mu sync.RWMutex // Protects all maps
 
 	// Core data
-	issues       map[string]*types.Issue       // ID -> Issue
+	issues       map[string]*types.Issue        // ID -> Issue
 	dependencies map[string][]*types.Dependency // IssueID -> Dependencies
-	labels       map[string][]string           // IssueID -> Labels
-	events       map[string][]*types.Event     // IssueID -> Events
-	comments     map[string][]*types.Comment   // IssueID -> Comments
-	config       map[string]string             // Config key-value pairs
-	metadata     map[string]string             // Metadata key-value pairs
-	counters     map[string]int                // Prefix -> Last ID
+	labels       map[string][]string            // IssueID -> Labels
+	events       map[string][]*types.Event      // IssueID -> Events
+	comments     map[string][]*types.Comment    // IssueID -> Comments
+	config       map[string]string              // Config key-value pairs
+	metadata     map[string]string              // Metadata key-value pairs
+	counters     map[string]int                 // Prefix -> Last ID
 
 	// Indexes for O(1) lookups
 	externalRefToID map[string]string // ExternalRef -> IssueID
@@ -189,8 +190,17 @@ func (m *MemoryStorage) CreateIssue(ctx context.Context, issue *types.Issue, act
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Validate
-	if err := issue.Validate(); err != nil {
+	// Get custom types and statuses for validation
+	var customTypes, customStatuses []string
+	if typeStr := m.config["types.custom"]; typeStr != "" {
+		customTypes = parseCustomStatuses(typeStr)
+	}
+	if statusStr := m.config["status.custom"]; statusStr != "" {
+		customStatuses = parseCustomStatuses(statusStr)
+	}
+
+	// Validate with custom types
+	if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
@@ -242,9 +252,18 @@ func (m *MemoryStorage) CreateIssues(ctx context.Context, issues []*types.Issue,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Get custom types and statuses for validation
+	var customTypes, customStatuses []string
+	if typeStr := m.config["types.custom"]; typeStr != "" {
+		customTypes = parseCustomStatuses(typeStr)
+	}
+	if statusStr := m.config["status.custom"]; statusStr != "" {
+		customStatuses = parseCustomStatuses(statusStr)
+	}
+
 	// Validate all first
 	for i, issue := range issues {
-		if err := issue.Validate(); err != nil {
+		if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
 			return fmt.Errorf("validation failed for issue %d: %w", i, err)
 		}
 	}
@@ -301,6 +320,15 @@ func (m *MemoryStorage) CreateIssues(ctx context.Context, issues []*types.Issue,
 	}
 
 	return nil
+}
+
+// CreateIssuesWithFullOptions creates multiple issues with full options control.
+// For MemoryStorage, this delegates to CreateIssues as the options (orphan handling,
+// prefix validation) are primarily relevant for persistent storage backends.
+func (m *MemoryStorage) CreateIssuesWithFullOptions(ctx context.Context, issues []*types.Issue, actor string, opts storage.BatchCreateOptions) error {
+	// MemoryStorage doesn't enforce prefix validation or orphan handling
+	// as it's primarily used for testing and no-db mode
+	return m.CreateIssues(ctx, issues, actor)
 }
 
 // GetIssue retrieves an issue by ID
@@ -620,6 +648,13 @@ func (m *MemoryStorage) SearchIssues(ctx context.Context, query string, filter t
 			}
 		}
 
+		// ID prefix filtering (for shell completion)
+		if filter.IDPrefix != "" {
+			if !strings.HasPrefix(issue.ID, filter.IDPrefix) {
+				continue
+			}
+		}
+
 		// Parent filtering (bd-yqhh): filter children by parent issue
 		if filter.ParentID != nil {
 			isChild := false
@@ -849,6 +884,20 @@ func (m *MemoryStorage) GetAllDependencyRecords(ctx context.Context) (map[string
 	return result, nil
 }
 
+// GetDependencyRecordsForIssues returns dependency records for specific issues
+func (m *MemoryStorage) GetDependencyRecordsForIssues(ctx context.Context, issueIDs []string) (map[string][]*types.Dependency, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make(map[string][]*types.Dependency)
+	for _, id := range issueIDs {
+		if deps, ok := m.dependencies[id]; ok {
+			result[id] = deps
+		}
+	}
+	return result, nil
+}
+
 // GetDirtyIssueHash returns the hash for dirty issue tracking
 func (m *MemoryStorage) GetDirtyIssueHash(ctx context.Context, issueID string) (string, error) {
 	// Memory storage doesn't track dirty hashes, return empty string
@@ -1059,8 +1108,9 @@ func (m *MemoryStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte
 		} else {
 			// Exclude workflow types from ready work by default
 			// These are internal workflow items, not work for polecats to claim
+			// (Gas Town types - not built into beads core)
 			switch issue.IssueType {
-			case types.TypeMergeRequest, types.TypeGate, types.TypeMolecule, types.TypeMessage:
+			case "merge-request", "gate", "molecule", "message":
 				continue
 			}
 		}
@@ -1276,6 +1326,19 @@ func (m *MemoryStorage) GetBlockedIssues(ctx context.Context, filter types.WorkF
 	return results, nil
 }
 
+// IsBlocked checks if an issue is blocked by open dependencies (GH#962).
+// Returns true if the issue has open blockers, along with the list of blocker IDs.
+func (m *MemoryStorage) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	blockers := m.getOpenBlockers(issueID)
+	if len(blockers) == 0 {
+		return false, nil, nil
+	}
+	return true, blockers, nil
+}
+
 // getAllDescendants returns all descendant IDs of a parent issue recursively
 func (m *MemoryStorage) getAllDescendants(parentID string) map[string]bool {
 	descendants := make(map[string]bool)
@@ -1400,6 +1463,28 @@ func (m *MemoryStorage) GetEvents(ctx context.Context, issueID string, limit int
 	return events, nil
 }
 
+// GetAllEventsSince returns all events with ID greater than sinceID, ordered by ID ascending.
+func (m *MemoryStorage) GetAllEventsSince(ctx context.Context, sinceID int64) ([]*types.Event, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var result []*types.Event
+	for _, issueEvents := range m.events {
+		for _, event := range issueEvents {
+			if event.ID > sinceID {
+				result = append(result, event)
+			}
+		}
+	}
+
+	// Sort by ID ascending
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID < result[j].ID
+	})
+
+	return result, nil
+}
+
 func (m *MemoryStorage) AddIssueComment(ctx context.Context, issueID, author, text string) (*types.Comment, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1410,6 +1495,24 @@ func (m *MemoryStorage) AddIssueComment(ctx context.Context, issueID, author, te
 		Author:    author,
 		Text:      text,
 		CreatedAt: time.Now(),
+	}
+
+	m.comments[issueID] = append(m.comments[issueID], comment)
+	m.dirty[issueID] = true
+
+	return comment, nil
+}
+
+func (m *MemoryStorage) ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	comment := &types.Comment{
+		ID:        int64(len(m.comments[issueID]) + 1),
+		IssueID:   issueID,
+		Author:    author,
+		Text:      text,
+		CreatedAt: createdAt,
 	}
 
 	m.comments[issueID] = append(m.comments[issueID], comment)
@@ -1433,6 +1536,20 @@ func (m *MemoryStorage) GetCommentsForIssues(ctx context.Context, issueIDs []str
 	for _, issueID := range issueIDs {
 		if comments, exists := m.comments[issueID]; exists {
 			result[issueID] = comments
+		}
+	}
+	return result, nil
+}
+
+// GetCommentCounts returns the number of comments for each issue in a single batch query.
+func (m *MemoryStorage) GetCommentCounts(ctx context.Context, issueIDs []string) (map[string]int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make(map[string]int)
+	for _, issueID := range issueIDs {
+		if comments, exists := m.comments[issueID]; exists {
+			result[issueID] = len(comments)
 		}
 	}
 	return result, nil
@@ -1578,10 +1695,9 @@ func (m *MemoryStorage) GetNextChildID(ctx context.Context, parentID string) (st
 		return "", fmt.Errorf("parent issue %s does not exist", parentID)
 	}
 
-	// Calculate depth (count dots)
-	depth := strings.Count(parentID, ".")
-	if depth >= 3 {
-		return "", fmt.Errorf("maximum hierarchy depth (3) exceeded for parent %s", parentID)
+	// Check hierarchy depth limit (GH#995)
+	if err := types.CheckHierarchyDepth(parentID, config.GetInt("hierarchy.max-depth")); err != nil {
+		return "", err
 	}
 
 	// Get or initialize counter for this parent
@@ -1657,6 +1773,18 @@ func parseCustomStatuses(value string) []string {
 		}
 	}
 	return result
+}
+
+// GetCustomTypes retrieves the list of custom issue types from config.
+func (m *MemoryStorage) GetCustomTypes(ctx context.Context) ([]string, error) {
+	value, err := m.GetConfig(ctx, "types.custom")
+	if err != nil {
+		return nil, err
+	}
+	if value == "" {
+		return nil, nil
+	}
+	return parseCustomStatuses(value), nil
 }
 
 // Metadata

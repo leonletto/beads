@@ -334,6 +334,24 @@ bd admin cleanup --dry-run --json                                 # Preview what
 bd admin cleanup --older-than 90 --cascade --force --json         # Delete old + dependents
 ```
 
+### Orphan Detection
+
+Find issues referenced in git commits that were never closed:
+
+```bash
+# Basic usage - scan current repo
+bd orphans
+
+# Cross-repo: scan CODE repo's commits against external BEADS database
+cd ~/my-code-repo
+bd orphans --db ~/my-beads-repo/.beads/beads.db
+
+# JSON output
+bd orphans --json
+```
+
+**Use case**: When your beads database lives in a separate repository from your code, run `bd orphans` from the code repo and point `--db` to the external database. This scans commits in your current directory while checking issue status from the specified database.
+
 ### Duplicate Detection & Merging
 
 ```bash
@@ -372,6 +390,33 @@ bd restore <id>  # View full history at time of compaction
 bd rename-prefix kw- --dry-run  # Preview changes
 bd rename-prefix kw- --json     # Apply rename
 ```
+
+### Reset
+
+Remove all local beads data and return to uninitialized state.
+
+```bash
+# Preview what would be removed (dry-run)
+bd admin reset
+
+# Actually perform the reset
+bd admin reset --force
+```
+
+**What gets removed:**
+- `.beads/` directory (database, JSONL, config)
+- Git hooks installed by bd
+- Merge driver configuration
+- Sync branch worktrees (`.git/beads-worktrees/`)
+
+**What does NOT get removed:**
+- Remote sync branch (if configured)
+- JSONL history in git commits
+- Remote repository data
+
+**Important:** If you want a complete clean slate (including remote data), see [Troubleshooting: Old data returns after reset](TROUBLESHOOTING.md#old-data-returns-after-reset).
+
+**Note:** The `--hard` and `--skip-init` flags mentioned in some discussions were never implemented. Use `--force` to perform the reset.
 
 ## Molecular Chemistry
 
@@ -586,6 +631,41 @@ bd sync
 # 5. Push to remote
 ```
 
+### Key-Value Store
+
+Store user-defined key-value pairs that persist across sessions. Useful for feature flags, environment config, or agent memory.
+
+```bash
+# Set a value
+bd kv set <key> <value>
+bd kv set feature_flag true
+bd kv set api_endpoint https://api.example.com
+
+# Get a value
+bd kv get <key>
+bd kv get feature_flag                 # Prints: true
+bd kv get missing_key                  # Prints: missing_key (not set), exits 1
+
+# Delete a key
+bd kv clear <key>
+bd kv clear feature_flag
+
+# List all key-value pairs
+bd kv list
+bd kv list --json                      # Machine-readable output
+```
+
+**Storage notes:**
+- KV data is stored in the local database with a `kv.` prefix
+- In `dolt-native` or `belt-and-suspenders` sync modes, KV data syncs via Dolt remotes
+- In `git-portable` mode, KV data stays local (not exported to JSONL)
+
+**Use cases:**
+- Feature flags: `bd set debug_mode true`
+- Environment config: `bd set staging_url https://staging.example.com`
+- Agent memory: `bd set last_migration 20240115_add_users.sql`
+- Session state: `bd set current_sprint 42`
+
 ## Issue Types
 
 - `bug` - Something broken that needs fixing
@@ -650,9 +730,20 @@ Default output without `--json`:
 
 ```bash
 bd ready
-# bd-42  Fix authentication bug  [P1, bug, in_progress]
-# bd-43  Add user settings page  [P2, feature, open]
+# ○ bd-42 [P1] [bug] - Fix authentication bug
+# ○ bd-43 [P2] [feature] - Add user settings page
 ```
+
+**Dependency visibility:** When issues have blocking dependencies, they appear inline:
+
+```bash
+bd list --parent epic-123
+# ○ bd-123.1 [P1] [task] - Design API (blocks: bd-123.2, bd-123.3)
+# ○ bd-123.2 [P1] [task] - Implement endpoints (blocked by: bd-123.1, blocks: bd-123.3)
+# ○ bd-123.3 [P1] [task] - Add tests (blocked by: bd-123.1, bd-123.2)
+```
+
+This makes blocking relationships visible without running `bd show` on each issue.
 
 ## Common Patterns for AI Agents
 
@@ -721,18 +812,21 @@ bd sync  # Force immediate sync, bypass debounce
 ```bash
 # Setup editor integration (choose based on your editor)
 bd setup factory  # Factory.ai Droid - creates/updates AGENTS.md (universal standard)
+bd setup codex    # Codex CLI - creates/updates AGENTS.md
 bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
 
 # Check if integration is installed
 bd setup factory --check
+bd setup codex --check
 bd setup claude --check
 bd setup cursor --check
 bd setup aider --check
 
 # Remove integration
 bd setup factory --remove
+bd setup codex --remove
 bd setup claude --remove
 bd setup cursor --remove
 bd setup aider --remove
@@ -747,6 +841,7 @@ bd setup claude --stealth    # Use stealth mode (flush only, no git operations)
 
 **What each setup does:**
 - **Factory.ai** (`bd setup factory`): Creates or updates AGENTS.md with beads workflow instructions (works with multiple AI tools using the AGENTS.md standard)
+- **Codex CLI** (`bd setup codex`): Creates or updates AGENTS.md with beads workflow instructions for Codex
 - **Claude Code** (`bd setup claude`): Adds hooks to Claude Code's settings.json that run `bd prime` on SessionStart and PreCompact events
 - **Cursor** (`bd setup cursor`): Creates `.cursor/rules/beads.mdc` with workflow instructions
 - **Aider** (`bd setup aider`): Creates `.aider.conf.yml` with bd workflow instructions

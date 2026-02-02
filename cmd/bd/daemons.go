@@ -13,7 +13,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/daemon"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 // JSON response types for daemons commands
@@ -180,9 +183,10 @@ Sends shutdown command via RPC, with SIGTERM fallback if RPC fails.`,
 			os.Exit(1)
 		}
 		// Find matching daemon by workspace path or PID
+		// Use PathsEqual for case-insensitive comparison on macOS/Windows (GH#869)
 		var targetDaemon *daemon.DaemonInfo
 		for _, d := range daemons {
-			if d.WorkspacePath == target || fmt.Sprintf("%d", d.PID) == target {
+			if utils.PathsEqual(d.WorkspacePath, target) || fmt.Sprintf("%d", d.PID) == target {
 				targetDaemon = &d
 				break
 			}
@@ -220,7 +224,8 @@ var daemonsRestartCmd = &cobra.Command{
 	Short: "Restart a specific bd daemon",
 	Long: `Restart a specific bd daemon by workspace path or PID.
 Stops the daemon gracefully, then starts a new one.`,
-	Args: cobra.ExactArgs(1),
+	Args:    cobra.ExactArgs(1),
+	PreRunE: guardDaemonStartForDolt,
 	Run: func(cmd *cobra.Command, args []string) {
 		target := args[0]
 		searchRoots, _ := cmd.Flags().GetStringSlice("search")
@@ -232,9 +237,10 @@ Stops the daemon gracefully, then starts a new one.`,
 			os.Exit(1)
 		}
 		// Find the target daemon
+		// Use PathsEqual for case-insensitive comparison on macOS/Windows (GH#869)
 		var targetDaemon *daemon.DaemonInfo
 		for _, d := range daemons {
-			if d.WorkspacePath == target || fmt.Sprintf("%d", d.PID) == target {
+			if utils.PathsEqual(d.WorkspacePath, target) || fmt.Sprintf("%d", d.PID) == target {
 				targetDaemon = &d
 				break
 			}
@@ -248,6 +254,23 @@ Stops the daemon gracefully, then starts a new one.`,
 			os.Exit(1)
 		}
 		workspace := targetDaemon.WorkspacePath
+
+		// Guardrail: don't (re)start daemons for single-process backends (e.g., embedded Dolt).
+		// This command may be run from a different workspace, so check the target workspace.
+		// Note: Dolt server mode supports multi-process, so GetCapabilities() is used.
+		targetBeadsDir := beads.FollowRedirect(filepath.Join(workspace, ".beads"))
+		if cfg, err := configfile.Load(targetBeadsDir); err == nil && cfg != nil {
+			if cfg.GetCapabilities().SingleProcessOnly {
+				if jsonOutput {
+					outputJSON(map[string]string{"error": fmt.Sprintf("daemon mode is not supported for backend %q (single-process only)", cfg.GetBackend())})
+				} else {
+					fmt.Fprintf(os.Stderr, "Error: cannot restart daemon for workspace %s: backend %q is single-process-only\n", workspace, cfg.GetBackend())
+					fmt.Fprintf(os.Stderr, "Hint: initialize the workspace with sqlite backend for daemon mode (e.g. `bd init --backend sqlite`)\n")
+				}
+				os.Exit(1)
+			}
+		}
+
 		// Stop the daemon
 		if !jsonOutput {
 			fmt.Printf("Stopping daemon for workspace: %s (PID %d)\n", workspace, targetDaemon.PID)
@@ -350,9 +373,10 @@ Supports tail mode (last N lines) and follow mode (like tail -f).`,
 			os.Exit(1)
 		}
 		// Find matching daemon by workspace path or PID
+		// Use PathsEqual for case-insensitive comparison on macOS/Windows (GH#869)
 		var targetDaemon *daemon.DaemonInfo
 		for _, d := range daemons {
-			if d.WorkspacePath == target || fmt.Sprintf("%d", d.PID) == target {
+			if utils.PathsEqual(d.WorkspacePath, target) || fmt.Sprintf("%d", d.PID) == target {
 				targetDaemon = &d
 				break
 			}

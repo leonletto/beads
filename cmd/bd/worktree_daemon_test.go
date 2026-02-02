@@ -22,9 +22,7 @@ import (
 // - In a worktree but sync-branch IS configured
 func TestShouldDisableDaemonForWorktree(t *testing.T) {
 	// Initialize config for tests
-	if err := config.Initialize(); err != nil {
-		t.Fatalf("Failed to initialize config: %v", err)
-	}
+	initConfigForTest(t)
 
 	// Save and restore environment variables
 	origSyncBranch := os.Getenv("BEADS_SYNC_BRANCH")
@@ -76,6 +74,7 @@ func TestShouldDisableDaemonForWorktree(t *testing.T) {
 			// Reset git caches after changing directory
 			git.ResetCaches()
 			// Reinitialize config to restore original state
+			config.ResetForTesting()
 			_ = config.Initialize()
 		}()
 		if err := os.Chdir(worktreeDir); err != nil {
@@ -86,13 +85,23 @@ func TestShouldDisableDaemonForWorktree(t *testing.T) {
 		// Reset git caches after changing directory (required for IsWorktree to re-detect)
 		git.ResetCaches()
 
+		// Set BEADS_DIR to the test's .beads directory to prevent
+		// git repo detection from finding the project's .beads
+		origBeadsDir := os.Getenv("BEADS_DIR")
+		os.Setenv("BEADS_DIR", mainDir+"/.beads")
+		defer func() {
+			if origBeadsDir != "" {
+				os.Setenv("BEADS_DIR", origBeadsDir)
+			} else {
+				os.Unsetenv("BEADS_DIR")
+			}
+		}()
+
 		// No sync-branch configured
 		os.Unsetenv("BEADS_SYNC_BRANCH")
 
 		// Reinitialize config to pick up the new directory's config.yaml
-		if err := config.Initialize(); err != nil {
-			t.Fatalf("Failed to reinitialize config: %v", err)
-		}
+		initConfigForTest(t)
 
 		// Debug: verify we're actually in a worktree
 		isWorktree := isGitWorktree()
@@ -116,6 +125,7 @@ func TestShouldDisableDaemonForWorktree(t *testing.T) {
 		defer func() {
 			_ = os.Chdir(origDir)
 			git.ResetCaches()
+			config.ResetForTesting()
 			_ = config.Initialize()
 		}()
 		if err := os.Chdir(worktreeDir); err != nil {
@@ -127,9 +137,7 @@ func TestShouldDisableDaemonForWorktree(t *testing.T) {
 		git.ResetCaches()
 
 		// Reinitialize config to pick up the new directory's config.yaml
-		if err := config.Initialize(); err != nil {
-			t.Fatalf("Failed to reinitialize config: %v", err)
-		}
+		initConfigForTest(t)
 
 		// Sync-branch configured via environment variable
 		os.Setenv("BEADS_SYNC_BRANCH", "beads-metadata")
@@ -152,6 +160,7 @@ func TestShouldDisableDaemonForWorktree(t *testing.T) {
 		defer func() {
 			_ = os.Chdir(origDir)
 			git.ResetCaches()
+			config.ResetForTesting()
 			_ = config.Initialize()
 		}()
 		if err := os.Chdir(worktreeDir); err != nil {
@@ -163,9 +172,7 @@ func TestShouldDisableDaemonForWorktree(t *testing.T) {
 		git.ResetCaches()
 
 		// Reinitialize config to pick up the new directory's config.yaml
-		if err := config.Initialize(); err != nil {
-			t.Fatalf("Failed to reinitialize config: %v", err)
-		}
+		initConfigForTest(t)
 
 		// NO env var or config.yaml sync-branch - only database config
 		os.Unsetenv("BEADS_SYNC_BRANCH")
@@ -184,9 +191,7 @@ func TestShouldDisableDaemonForWorktree(t *testing.T) {
 // respects the worktree+sync-branch logic.
 func TestShouldAutoStartDaemonWorktreeIntegration(t *testing.T) {
 	// Initialize config for tests
-	if err := config.Initialize(); err != nil {
-		t.Fatalf("Failed to initialize config: %v", err)
-	}
+	initConfigForTest(t)
 
 	// Save and restore environment variables
 	origNoDaemon := os.Getenv("BEADS_NO_DAEMON")
@@ -207,6 +212,7 @@ func TestShouldAutoStartDaemonWorktreeIntegration(t *testing.T) {
 		defer func() {
 			_ = os.Chdir(origDir)
 			git.ResetCaches()
+			config.ResetForTesting()
 			_ = config.Initialize()
 		}()
 		if err := os.Chdir(worktreeDir); err != nil {
@@ -217,15 +223,25 @@ func TestShouldAutoStartDaemonWorktreeIntegration(t *testing.T) {
 		// Reset git caches after changing directory
 		git.ResetCaches()
 
+		// Set BEADS_DIR to the test's .beads directory to prevent
+		// git repo detection from finding the project's .beads
+		origBeadsDir := os.Getenv("BEADS_DIR")
+		os.Setenv("BEADS_DIR", mainDir+"/.beads")
+		defer func() {
+			if origBeadsDir != "" {
+				os.Setenv("BEADS_DIR", origBeadsDir)
+			} else {
+				os.Unsetenv("BEADS_DIR")
+			}
+		}()
+
 		// Clear all daemon-related env vars
 		os.Unsetenv("BEADS_NO_DAEMON")
 		os.Unsetenv("BEADS_AUTO_START_DAEMON")
 		os.Unsetenv("BEADS_SYNC_BRANCH")
 
 		// Reinitialize config to pick up the new directory's config.yaml
-		if err := config.Initialize(); err != nil {
-			t.Fatalf("Failed to reinitialize config: %v", err)
-		}
+		initConfigForTest(t)
 
 		result := shouldAutoStartDaemon()
 		if result {
@@ -245,6 +261,7 @@ func TestShouldAutoStartDaemonWorktreeIntegration(t *testing.T) {
 		defer func() {
 			_ = os.Chdir(origDir)
 			git.ResetCaches()
+			config.ResetForTesting()
 			_ = config.Initialize()
 		}()
 		if err := os.Chdir(worktreeDir); err != nil {
@@ -256,9 +273,7 @@ func TestShouldAutoStartDaemonWorktreeIntegration(t *testing.T) {
 		git.ResetCaches()
 
 		// Reinitialize config to pick up the new directory's config.yaml
-		if err := config.Initialize(); err != nil {
-			t.Fatalf("Failed to reinitialize config: %v", err)
-		}
+		initConfigForTest(t)
 
 		// Clear daemon env vars but set sync-branch
 		os.Unsetenv("BEADS_NO_DAEMON")
@@ -283,6 +298,7 @@ func TestShouldAutoStartDaemonWorktreeIntegration(t *testing.T) {
 		defer func() {
 			_ = os.Chdir(origDir)
 			git.ResetCaches()
+			config.ResetForTesting()
 			_ = config.Initialize()
 		}()
 		if err := os.Chdir(worktreeDir); err != nil {
@@ -294,9 +310,7 @@ func TestShouldAutoStartDaemonWorktreeIntegration(t *testing.T) {
 		git.ResetCaches()
 
 		// Reinitialize config to pick up the new directory's config.yaml
-		if err := config.Initialize(); err != nil {
-			t.Fatalf("Failed to reinitialize config: %v", err)
-		}
+		initConfigForTest(t)
 
 		// Set BEADS_NO_DAEMON (should override everything)
 		os.Setenv("BEADS_NO_DAEMON", "1")

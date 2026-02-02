@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/factory"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -181,22 +181,15 @@ func CheckOrphanedDependencies(path string) DoctorCheck {
 }
 
 // CheckDuplicateIssues detects issues with identical content.
-func CheckDuplicateIssues(path string) DoctorCheck {
+// When gastownMode is true, the threshold parameter defines how many duplicates
+// are acceptable before warning (default 1000 for gastown's ephemeral wisps).
+func CheckDuplicateIssues(path string, gastownMode bool, gastownThreshold int) DoctorCheck {
 	// Follow redirect to resolve actual beads directory (bd-tvus fix)
 	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-	dbPath := filepath.Join(beadsDir, beads.CanonicalDatabaseName)
 
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return DoctorCheck{
-			Name:    "Duplicate Issues",
-			Status:  "ok",
-			Message: "N/A (no database)",
-		}
-	}
-
-	// Open store to use existing duplicate detection
+	// Open store using factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
 	ctx := context.Background()
-	store, err := sqlite.New(ctx, dbPath)
+	store, err := factory.NewFromConfig(ctx, beadsDir)
 	if err != nil {
 		return DoctorCheck{
 			Name:    "Duplicate Issues",
@@ -215,13 +208,15 @@ func CheckDuplicateIssues(path string) DoctorCheck {
 		}
 	}
 
-	// Find duplicates by title+description hash
+	// Find duplicates by content hash (matching bd duplicates algorithm)
+	// Only check open issues - closed issues are done, no point flagging duplicates
 	seen := make(map[string][]string) // hash -> list of IDs
 	for _, issue := range issues {
-		if issue.Status == types.StatusTombstone {
+		if issue.Status == types.StatusTombstone || issue.Status == types.StatusClosed {
 			continue
 		}
-		key := issue.Title + "|" + issue.Description
+		// Content key matches bd duplicates: title + description + design + acceptanceCriteria + status
+		key := issue.Title + "|" + issue.Description + "|" + issue.Design + "|" + issue.AcceptanceCriteria + "|" + string(issue.Status)
 		seen[key] = append(seen[key], issue.ID)
 	}
 
@@ -234,7 +229,13 @@ func CheckDuplicateIssues(path string) DoctorCheck {
 		}
 	}
 
-	if duplicateGroups == 0 {
+	// Apply threshold based on mode
+	threshold := 0 // Default: any duplicates are warnings
+	if gastownMode {
+		threshold = gastownThreshold // Gastown: configurable threshold (default 1000)
+	}
+
+	if totalDuplicates == 0 {
 		return DoctorCheck{
 			Name:    "Duplicate Issues",
 			Status:  "ok",
@@ -242,12 +243,26 @@ func CheckDuplicateIssues(path string) DoctorCheck {
 		}
 	}
 
+	// Only warn if duplicate count exceeds threshold
+	if totalDuplicates > threshold {
+		return DoctorCheck{
+			Name:    "Duplicate Issues",
+			Status:  "warning",
+			Message: fmt.Sprintf("%d duplicate issue(s) in %d group(s)", totalDuplicates, duplicateGroups),
+			Detail:  "Duplicates cannot be auto-fixed",
+			Fix:     "Run 'bd duplicates' to review and merge duplicates",
+		}
+	}
+
+	// Under threshold - OK
+	message := "No duplicate issues"
+	if gastownMode && totalDuplicates > 0 {
+		message = fmt.Sprintf("%d duplicate(s) detected (within gastown threshold of %d)", totalDuplicates, threshold)
+	}
 	return DoctorCheck{
 		Name:    "Duplicate Issues",
-		Status:  "warning",
-		Message: fmt.Sprintf("%d duplicate issue(s) in %d group(s)", totalDuplicates, duplicateGroups),
-		Detail:  "Duplicates cannot be auto-fixed",
-		Fix:     "Run 'bd duplicates' to review and merge duplicates",
+		Status:  "ok",
+		Message: message,
 	}
 }
 
@@ -386,6 +401,79 @@ func CheckChildParentDependencies(path string) DoctorCheck {
 		Detail:   detail,
 		Fix:      "Run 'bd doctor --fix --fix-child-parent' to remove (if unintentional)",
 		Category: CategoryMetadata,
+	}
+}
+
+// CheckRedirectSyncBranchConflict detects when both redirect and sync-branch are configured.
+// This is a configuration error: redirect means "my database is elsewhere (I'm a client)",
+// while sync-branch means "I own my database and sync it myself". These are mutually exclusive.
+// bd-wayc3: Added to detect incompatible configuration before sync fails.
+func CheckRedirectSyncBranchConflict(path string) DoctorCheck {
+	beadsDir := filepath.Join(path, ".beads")
+
+	// Check if redirect file exists
+	redirectFile := filepath.Join(beadsDir, beads.RedirectFileName)
+	if _, err := os.Stat(redirectFile); os.IsNotExist(err) {
+		return DoctorCheck{
+			Name:     "Redirect + Sync-Branch",
+			Status:   StatusOK,
+			Message:  "No redirect configured",
+			Category: CategoryData,
+		}
+	}
+
+	// Redirect exists - check if sync-branch is also configured
+	// Read config.yaml directly since we need to check the local config, not the resolved one
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	data, err := os.ReadFile(configPath) // #nosec G304 - path constructed safely
+	if err != nil {
+		// No config file - no conflict possible
+		return DoctorCheck{
+			Name:     "Redirect + Sync-Branch",
+			Status:   StatusOK,
+			Message:  "Redirect active (no local config)",
+			Category: CategoryData,
+		}
+	}
+
+	// Parse sync-branch from config.yaml (simple line-based parsing)
+	// Handles: sync-branch: value, sync-branch: "value", sync-branch: 'value'
+	// Also handles trailing comments: sync-branch: value # comment
+	configStr := string(data)
+	for _, line := range strings.Split(configStr, "\n") {
+		line = strings.TrimSpace(line)
+		// Skip comments
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "sync-branch:") {
+			value := strings.TrimPrefix(line, "sync-branch:")
+			// Remove trailing comment if present
+			if idx := strings.Index(value, "#"); idx != -1 {
+				value = value[:idx]
+			}
+			value = strings.TrimSpace(value)
+			// Remove quotes if present
+			value = strings.Trim(value, `"'`)
+			if value != "" {
+				// Found both redirect and sync-branch - conflict!
+				return DoctorCheck{
+					Name:     "Redirect + Sync-Branch",
+					Status:   StatusWarning,
+					Message:  fmt.Sprintf("Redirect active but sync-branch=%q configured", value),
+					Detail:   "Redirect and sync-branch are mutually exclusive. Redirected clones should not have sync-branch.",
+					Fix:      "Remove sync-branch from config.yaml (set to empty string or delete the line)",
+					Category: CategoryData,
+				}
+			}
+		}
+	}
+
+	return DoctorCheck{
+		Name:     "Redirect + Sync-Branch",
+		Status:   StatusOK,
+		Message:  "Redirect active (no sync-branch conflict)",
+		Category: CategoryData,
 	}
 }
 

@@ -391,16 +391,172 @@ func TestValidateWithCustomStatuses(t *testing.T) {
 	}
 }
 
+// TestValidateForImport tests the federation trust model (bd-9ji4z):
+// - Built-in types are validated (catch typos)
+// - Non-built-in types are trusted (child repo already validated)
+func TestValidateForImport(t *testing.T) {
+	tests := []struct {
+		name    string
+		issue   Issue
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "built-in type task passes",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: TypeTask,
+			},
+			wantErr: false,
+		},
+		{
+			name: "built-in type bug passes",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: TypeBug,
+			},
+			wantErr: false,
+		},
+		{
+			name: "custom type pm is trusted (not in parent config)",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: IssueType("pm"), // Custom type from child repo
+			},
+			wantErr: false, // Should pass - federation trust model
+		},
+		{
+			name: "custom type llm is trusted",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: IssueType("llm"), // Custom type from child repo
+			},
+			wantErr: false, // Should pass - federation trust model
+		},
+		{
+			name: "custom type passes (federation trust)",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: IssueType("agent"), // Custom type (no longer built-in)
+			},
+			wantErr: false,
+		},
+		{
+			name: "empty type defaults to task (handled by SetDefaults)",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: IssueType(""), // Empty is allowed
+			},
+			wantErr: false,
+		},
+		{
+			name: "other validations still run - missing title",
+			issue: Issue{
+				Title:     "", // Missing required field
+				Status:    StatusOpen,
+				Priority:  1,
+				IssueType: IssueType("pm"),
+			},
+			wantErr: true,
+			errMsg:  "title is required",
+		},
+		{
+			name: "other validations still run - invalid priority",
+			issue: Issue{
+				Title:     "Test Issue",
+				Status:    StatusOpen,
+				Priority:  10, // Invalid
+				IssueType: IssueType("pm"),
+			},
+			wantErr: true,
+			errMsg:  "priority must be between 0 and 4",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.issue.ValidateForImport(nil) // No custom statuses needed for these tests
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ValidateForImport() expected error, got nil")
+					return
+				}
+				if tt.errMsg != "" && !contains(err.Error(), tt.errMsg) {
+					t.Errorf("ValidateForImport() error = %v, want error containing %q", err, tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("ValidateForImport() unexpected error = %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateForImportVsValidateWithCustom contrasts the two validation modes
+func TestValidateForImportVsValidateWithCustom(t *testing.T) {
+	// Issue with custom type that's NOT in customTypes list
+	issue := Issue{
+		Title:     "Test Issue",
+		Status:    StatusOpen,
+		Priority:  1,
+		IssueType: IssueType("pm"), // Custom type not configured in parent
+	}
+
+	// ValidateWithCustom (normal mode): should fail without pm in customTypes
+	err := issue.ValidateWithCustom(nil, nil)
+	if err == nil {
+		t.Error("ValidateWithCustom() should fail for custom type without config")
+	}
+
+	// ValidateWithCustom: should pass with pm in customTypes
+	err = issue.ValidateWithCustom(nil, []string{"pm"})
+	if err != nil {
+		t.Errorf("ValidateWithCustom() with pm config should pass, got: %v", err)
+	}
+
+	// ValidateForImport (federation trust mode): should pass without any config
+	err = issue.ValidateForImport(nil)
+	if err != nil {
+		t.Errorf("ValidateForImport() should trust custom type, got: %v", err)
+	}
+}
+
 func TestIssueTypeIsValid(t *testing.T) {
 	tests := []struct {
 		issueType IssueType
 		valid     bool
 	}{
+		// Core work types are always valid
 		{TypeBug, true},
 		{TypeFeature, true},
 		{TypeTask, true},
 		{TypeEpic, true},
 		{TypeChore, true},
+		// Gas Town types are now custom types (not built-in)
+		{IssueType("message"), false},
+		{IssueType("merge-request"), false},
+		{IssueType("molecule"), false},
+		{IssueType("gate"), false},
+		{IssueType("agent"), false},
+		{IssueType("role"), false},
+		{IssueType("convoy"), false},
+		{TypeEvent, false},
+		{IssueType("slot"), false},
+		{IssueType("rig"), false},
+		// Invalid types
 		{IssueType("invalid"), false},
 		{IssueType(""), false},
 	}
@@ -411,6 +567,59 @@ func TestIssueTypeIsValid(t *testing.T) {
 				t.Errorf("IssueType(%q).IsValid() = %v, want %v", tt.issueType, got, tt.valid)
 			}
 		})
+	}
+}
+
+// TestEventTypeValidation verifies that event type is accepted by validation
+// even without being in types.custom, since set-state creates event beads
+// internally for audit trail (GH#1356).
+func TestEventTypeValidation(t *testing.T) {
+	now := time.Now()
+	event := Issue{
+		Title:     "state change event",
+		Status:    StatusOpen,
+		Priority:  4,
+		IssueType: TypeEvent,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	// event is not a core work type
+	if TypeEvent.IsValid() {
+		t.Fatal("event should not be a core work type")
+	}
+
+	// event is an internal built-in type
+	if !TypeEvent.IsBuiltIn() {
+		t.Error("TypeEvent.IsBuiltIn() = false, want true")
+	}
+
+	// event should be accepted by IsValidWithCustom without explicit config
+	if !TypeEvent.IsValidWithCustom(nil) {
+		t.Error("TypeEvent.IsValidWithCustom(nil) = false, want true")
+	}
+
+	// ValidateWithCustom should accept event without custom types config
+	if err := event.ValidateWithCustom(nil, nil); err != nil {
+		t.Errorf("ValidateWithCustom() should accept event type, got: %v", err)
+	}
+
+	// event should also work alongside other custom types
+	if !TypeEvent.IsValidWithCustom([]string{"molecule", "gate"}) {
+		t.Error("TypeEvent.IsValidWithCustom(custom list) = false, want true")
+	}
+
+	// custom types must NOT be treated as built-in
+	if IssueType("molecule").IsBuiltIn() {
+		t.Error("IssueType(molecule).IsBuiltIn() = true, want false")
+	}
+	if IssueType("gate").IsBuiltIn() {
+		t.Error("IssueType(gate).IsBuiltIn() = true, want false")
+	}
+
+	// Normalize must not map event to a core type
+	if TypeEvent.Normalize() != TypeEvent {
+		t.Errorf("TypeEvent.Normalize() = %q, want %q", TypeEvent.Normalize(), TypeEvent)
 	}
 }
 
@@ -425,14 +634,12 @@ func TestIssueTypeRequiredSections(t *testing.T) {
 		{TypeTask, 1, "## Acceptance Criteria"},
 		{TypeEpic, 1, "## Success Criteria"},
 		{TypeChore, 0, ""},
-		{TypeMessage, 0, ""},
-		{TypeMolecule, 0, ""},
-		{TypeGate, 0, ""},
-		{TypeAgent, 0, ""},
-		{TypeRole, 0, ""},
-		{TypeConvoy, 0, ""},
+		// Gas Town types are now custom and have no required sections
+		{IssueType("message"), 0, ""},
+		{IssueType("molecule"), 0, ""},
+		{IssueType("gate"), 0, ""},
 		{TypeEvent, 0, ""},
-		{TypeMergeRequest, 0, ""},
+		{IssueType("merge-request"), 0, ""},
 	}
 
 	for _, tt := range tests {
@@ -558,6 +765,7 @@ func TestDependencyTypeIsWellKnown(t *testing.T) {
 		{DepAuthoredBy, true},
 		{DepAssignedTo, true},
 		{DepApprovedBy, true},
+		{DepAttests, true},
 		{DepTracks, true},
 		{DepUntil, true},
 		{DepCausedBy, true},
@@ -593,6 +801,7 @@ func TestDependencyTypeAffectsReadyWork(t *testing.T) {
 		{DepAuthoredBy, false},
 		{DepAssignedTo, false},
 		{DepApprovedBy, false},
+		{DepAttests, false},
 		{DepTracks, false},
 		{DepUntil, false},
 		{DepCausedBy, false},

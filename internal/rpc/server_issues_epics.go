@@ -8,11 +8,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/util"
 	"github.com/steveyegge/beads/internal/utils"
 )
+
+// containsLabel checks if a label exists in the list
+func containsLabel(labels []string, label string) bool {
+	for _, l := range labels {
+		if l == label {
+			return true
+		}
+	}
+	return false
+}
 
 // parseTimeRPC parses time strings in multiple formats (RFC3339, YYYY-MM-DD, etc.)
 // Matches the parseTimeFlag behavior in cmd/bd/list.go for CLI parity
@@ -42,7 +52,7 @@ func strValue(p *string) string {
 	return *p
 }
 
-func updatesFromArgs(a UpdateArgs) map[string]interface{} {
+func updatesFromArgs(a UpdateArgs) (map[string]interface{}, error) {
 	u := map[string]interface{}{}
 	if a.Title != nil {
 		u["title"] = *a.Title
@@ -82,7 +92,7 @@ func updatesFromArgs(a UpdateArgs) map[string]interface{} {
 		u["sender"] = *a.Sender
 	}
 	if a.Ephemeral != nil {
-		u["ephemeral"] = *a.Ephemeral
+		u["wisp"] = *a.Ephemeral // Storage API uses "wisp", maps to "ephemeral" column
 	}
 	if a.RepliesTo != nil {
 		u["replies_to"] = *a.RepliesTo
@@ -135,7 +145,49 @@ func updatesFromArgs(a UpdateArgs) map[string]interface{} {
 	if a.EventPayload != nil {
 		u["event_payload"] = *a.EventPayload
 	}
-	return u
+	// Gate fields
+	if a.AwaitID != nil {
+		u["await_id"] = *a.AwaitID
+	}
+	if len(a.Waiters) > 0 {
+		u["waiters"] = a.Waiters
+	}
+	// Slot fields
+	if a.Holder != nil {
+		u["holder"] = *a.Holder
+	}
+	// Time-based scheduling fields (GH#820)
+	if a.DueAt != nil {
+		if *a.DueAt == "" {
+			u["due_at"] = nil // Clear the field
+		} else {
+			// Try date-only format first (YYYY-MM-DD)
+			if t, err := time.ParseInLocation("2006-01-02", *a.DueAt, time.Local); err == nil {
+				u["due_at"] = t
+			} else if t, err := time.Parse(time.RFC3339, *a.DueAt); err == nil {
+				// Try RFC3339 format (2025-01-15T10:00:00Z)
+				u["due_at"] = t
+			} else {
+				return nil, fmt.Errorf("invalid due_at format %q: use YYYY-MM-DD or RFC3339", *a.DueAt)
+			}
+		}
+	}
+	if a.DeferUntil != nil {
+		if *a.DeferUntil == "" {
+			u["defer_until"] = nil // Clear the field
+		} else {
+			// Try date-only format first (YYYY-MM-DD)
+			if t, err := time.ParseInLocation("2006-01-02", *a.DeferUntil, time.Local); err == nil {
+				u["defer_until"] = t
+			} else if t, err := time.Parse(time.RFC3339, *a.DeferUntil); err == nil {
+				// Try RFC3339 format (2025-01-15T10:00:00Z)
+				u["defer_until"] = t
+			} else {
+				return nil, fmt.Errorf("invalid defer_until format %q: use YYYY-MM-DD or RFC3339", *a.DeferUntil)
+			}
+		}
+	}
+	return u, nil
 }
 
 func (s *Server) handleCreate(req *Request) Response {
@@ -200,6 +252,40 @@ func (s *Server) handleCreate(req *Request) Response {
 		externalRef = &createArgs.ExternalRef
 	}
 
+	// Parse DueAt if provided (GH#820)
+	var dueAt *time.Time
+	if createArgs.DueAt != "" {
+		// Try date-only format first (YYYY-MM-DD)
+		if t, err := time.ParseInLocation("2006-01-02", createArgs.DueAt, time.Local); err == nil {
+			dueAt = &t
+		} else if t, err := time.Parse(time.RFC3339, createArgs.DueAt); err == nil {
+			// Try RFC3339 format (2025-01-15T10:00:00Z)
+			dueAt = &t
+		} else {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("invalid due_at format %q. Examples: 2025-01-15, 2025-01-15T10:00:00Z", createArgs.DueAt),
+			}
+		}
+	}
+
+	// Parse DeferUntil if provided (GH#820, GH#950, GH#952)
+	var deferUntil *time.Time
+	if createArgs.DeferUntil != "" {
+		// Try date-only format first (YYYY-MM-DD)
+		if t, err := time.ParseInLocation("2006-01-02", createArgs.DeferUntil, time.Local); err == nil {
+			deferUntil = &t
+		} else if t, err := time.Parse(time.RFC3339, createArgs.DeferUntil); err == nil {
+			// Try RFC3339 format (2025-01-15T10:00:00Z)
+			deferUntil = &t
+		} else {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("invalid defer_until format %q. Examples: 2025-01-15, 2025-01-15T10:00:00Z", createArgs.DeferUntil),
+			}
+		}
+	}
+
 	issue := &types.Issue{
 		ID:                 issueID,
 		Title:              createArgs.Title,
@@ -220,6 +306,7 @@ func (s *Server) handleCreate(req *Request) Response {
 		// ID generation
 		IDPrefix:  createArgs.IDPrefix,
 		CreatedBy: createArgs.CreatedBy,
+		Owner:     createArgs.Owner,
 		// Molecule type
 		MolType: types.MolType(createArgs.MolType),
 		// Agent identity fields
@@ -230,6 +317,9 @@ func (s *Server) handleCreate(req *Request) Response {
 		Actor:     createArgs.EventActor,
 		Target:    createArgs.EventTarget,
 		Payload:   createArgs.EventPayload,
+		// Time-based scheduling (GH#820, GH#950, GH#952)
+		DueAt:      dueAt,
+		DeferUntil: deferUntil,
 	}
 	
 	// Check if any dependencies are discovered-from type
@@ -316,7 +406,8 @@ func (s *Server) handleCreate(req *Request) Response {
 	}
 
 	// Auto-add role_type/rig labels for agent beads (enables filtering queries)
-	if issue.IssueType == types.TypeAgent {
+	// Check for gt:agent label to identify agent beads (Gas Town separation)
+	if containsLabel(createArgs.Labels, "gt:agent") {
 		if issue.RoleType != "" {
 			label := "role_type:" + issue.RoleType
 			if err := store.AddLabel(ctx, issue.ID, label, s.reqActor(req)); err != nil {
@@ -496,7 +587,13 @@ func (s *Server) handleUpdate(req *Request) Response {
 		}
 	}
 
-	updates := updatesFromArgs(updateArgs)
+	updates, err := updatesFromArgs(updateArgs)
+	if err != nil {
+		return Response{
+			Success: false,
+			Error:   err.Error(),
+		}
+	}
 
 	// Apply regular field updates if any
 	if len(updates) > 0 {
@@ -560,13 +657,14 @@ func (s *Server) handleUpdate(req *Request) Response {
 	}
 
 	// Auto-add role_type/rig labels for agent beads when these fields are set
-	// This enables filtering queries like: bd list --type=agent --label=role_type:witness
+	// This enables filtering queries like: bd list --label=gt:agent --label=role_type:witness
 	// Note: We remove old role_type/rig labels first to prevent accumulation
-	if issue.IssueType == types.TypeAgent {
+	// Check for gt:agent label to identify agent beads (Gas Town separation)
+	issueLabels, _ := store.GetLabels(ctx, updateArgs.ID)
+	if containsLabel(issueLabels, "gt:agent") {
 		if updateArgs.RoleType != nil && *updateArgs.RoleType != "" {
 			// Remove any existing role_type:* labels first
-			existingLabels, _ := store.GetLabels(ctx, updateArgs.ID)
-			for _, l := range existingLabels {
+			for _, l := range issueLabels {
 				if strings.HasPrefix(l, "role_type:") {
 					_ = store.RemoveLabel(ctx, updateArgs.ID, l, actor)
 				}
@@ -582,8 +680,7 @@ func (s *Server) handleUpdate(req *Request) Response {
 		}
 		if updateArgs.Rig != nil && *updateArgs.Rig != "" {
 			// Remove any existing rig:* labels first
-			existingLabels, _ := store.GetLabels(ctx, updateArgs.ID)
-			for _, l := range existingLabels {
+			for _, l := range issueLabels {
 				if strings.HasPrefix(l, "rig:") {
 					_ = store.RemoveLabel(ctx, updateArgs.ID, l, actor)
 				}
@@ -735,6 +832,23 @@ func (s *Server) handleClose(req *Request) Response {
 		}
 	}
 
+	// Check if issue has open blockers (GH#962)
+	if !closeArgs.Force {
+		blocked, blockers, err := store.IsBlocked(ctx, closeArgs.ID)
+		if err != nil {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("failed to check blockers: %v", err),
+			}
+		}
+		if blocked && len(blockers) > 0 {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("cannot close %s: blocked by open issues %v (use --force to override)", closeArgs.ID, blockers),
+			}
+		}
+	}
+
 	// Capture old status for rich mutation event
 	oldStatus := ""
 	if issue != nil {
@@ -813,14 +927,14 @@ func (s *Server) handleDelete(req *Request) Response {
 
 	ctx := s.reqCtx(req)
 
-	// Use batch delete for cascade/multi-issue operations on SQLite storage
+	// Use batch delete for cascade/multi-issue operations if storage supports it
 	// This handles cascade delete properly by expanding dependents recursively
 	// For simple single-issue deletes, use the direct path to preserve custom reason
-	if sqlStore, ok := store.(*sqlite.SQLiteStorage); ok {
+	if batchDeleter, ok := store.(storage.BatchDeleter); ok {
 		// Use batch delete if: cascade enabled, force enabled, multiple IDs, or dry-run
 		useBatchDelete := deleteArgs.Cascade || deleteArgs.Force || len(deleteArgs.IDs) > 1 || deleteArgs.DryRun
 		if useBatchDelete {
-			result, err := sqlStore.DeleteIssues(ctx, deleteArgs.IDs, deleteArgs.Cascade, deleteArgs.Force, deleteArgs.DryRun)
+			result, err := batchDeleter.DeleteIssues(ctx, deleteArgs.IDs, deleteArgs.Cascade, deleteArgs.Force, deleteArgs.DryRun)
 			if err != nil {
 				return Response{
 					Success: false,
@@ -1117,6 +1231,57 @@ func (s *Server) handleList(req *Request) Response {
 		}
 	}
 
+	// Type exclusion (for hiding internal types like gates, bd-7zka.2)
+	if len(listArgs.ExcludeTypes) > 0 {
+		for _, t := range listArgs.ExcludeTypes {
+			filter.ExcludeTypes = append(filter.ExcludeTypes, types.IssueType(t))
+		}
+	}
+
+	// Time-based scheduling filters (GH#820)
+	filter.Deferred = listArgs.Deferred
+	if listArgs.DeferAfter != "" {
+		t, err := parseTimeRPC(listArgs.DeferAfter)
+		if err != nil {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("invalid --defer-after date: %v", err),
+			}
+		}
+		filter.DeferAfter = &t
+	}
+	if listArgs.DeferBefore != "" {
+		t, err := parseTimeRPC(listArgs.DeferBefore)
+		if err != nil {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("invalid --defer-before date: %v", err),
+			}
+		}
+		filter.DeferBefore = &t
+	}
+	if listArgs.DueAfter != "" {
+		t, err := parseTimeRPC(listArgs.DueAfter)
+		if err != nil {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("invalid --due-after date: %v", err),
+			}
+		}
+		filter.DueAfter = &t
+	}
+	if listArgs.DueBefore != "" {
+		t, err := parseTimeRPC(listArgs.DueBefore)
+		if err != nil {
+			return Response{
+				Success: false,
+				Error:   fmt.Sprintf("invalid --due-before date: %v", err),
+			}
+		}
+		filter.DueBefore = &t
+	}
+	filter.Overdue = listArgs.Overdue
+
 	// Guard against excessive ID lists to avoid SQLite parameter limits
 	const maxIDs = 1000
 	if len(filter.IDs) > maxIDs {
@@ -1147,6 +1312,13 @@ func (s *Server) handleList(req *Request) Response {
 		issueIDs[i] = issue.ID
 	}
 	depCounts, _ := store.GetDependencyCounts(ctx, issueIDs)
+	commentCounts, _ := store.GetCommentCounts(ctx, issueIDs)
+
+	// Populate dependencies for JSON output
+	allDeps, _ := store.GetAllDependencyRecords(ctx)
+	for _, issue := range issues {
+		issue.Dependencies = allDeps[issue.ID]
+	}
 
 	// Build response with counts
 	issuesWithCounts := make([]*types.IssueWithCounts, len(issues))
@@ -1159,6 +1331,7 @@ func (s *Server) handleList(req *Request) Response {
 			Issue:           issue,
 			DependencyCount: counts.DependencyCount,
 			DependentCount:  counts.DependentCount,
+			CommentCount:    commentCounts[issue.ID],
 		}
 	}
 
@@ -1467,30 +1640,11 @@ func (s *Server) handleShow(req *Request) Response {
 
 	// Populate labels, dependencies (with metadata), and dependents (with metadata)
 	labels, _ := store.GetLabels(ctx, issue.ID)
-	
+
 	// Get dependencies and dependents with metadata (including dependency type)
-	var deps []*types.IssueWithDependencyMetadata
-	var dependents []*types.IssueWithDependencyMetadata
-	if sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {
-		deps, _ = sqliteStore.GetDependenciesWithMetadata(ctx, issue.ID)
-		dependents, _ = sqliteStore.GetDependentsWithMetadata(ctx, issue.ID)
-	} else {
-		// Fallback for non-SQLite storage (won't have dependency type metadata)
-		regularDeps, _ := store.GetDependencies(ctx, issue.ID)
-		for _, d := range regularDeps {
-			deps = append(deps, &types.IssueWithDependencyMetadata{
-				Issue:          *d,
-				DependencyType: types.DepBlocks, // default
-			})
-		}
-		regularDependents, _ := store.GetDependents(ctx, issue.ID)
-		for _, d := range regularDependents {
-			dependents = append(dependents, &types.IssueWithDependencyMetadata{
-				Issue:          *d,
-				DependencyType: types.DepBlocks, // default
-			})
-		}
-	}
+	// These methods are part of the Storage interface - no type assertion needed
+	deps, _ := store.GetDependenciesWithMetadata(ctx, issue.ID)
+	dependents, _ := store.GetDependentsWithMetadata(ctx, issue.ID)
 
 	// Fetch comments
 	comments, _ := store.GetIssueComments(ctx, issue.ID)
@@ -1529,14 +1683,15 @@ func (s *Server) handleReady(req *Request) Response {
 	}
 
 	wf := types.WorkFilter{
-		Status:     types.StatusOpen,
-		Type:       readyArgs.Type,
-		Priority:   readyArgs.Priority,
-		Unassigned: readyArgs.Unassigned,
-		Limit:      readyArgs.Limit,
-		SortPolicy: types.SortPolicy(readyArgs.SortPolicy),
-		Labels:     util.NormalizeLabels(readyArgs.Labels),
-		LabelsAny:  util.NormalizeLabels(readyArgs.LabelsAny),
+		// Leave Status empty to get both 'open' and 'in_progress' (GH#5aml)
+		Type:            readyArgs.Type,
+		Priority:        readyArgs.Priority,
+		Unassigned:      readyArgs.Unassigned,
+		Limit:           readyArgs.Limit,
+		SortPolicy:      types.SortPolicy(readyArgs.SortPolicy),
+		Labels:          util.NormalizeLabels(readyArgs.Labels),
+		LabelsAny:       util.NormalizeLabels(readyArgs.LabelsAny),
+		IncludeDeferred: readyArgs.IncludeDeferred, // GH#820
 	}
 	if readyArgs.Assignee != "" && !readyArgs.Unassigned {
 		wf.Assignee = &readyArgs.Assignee
@@ -1558,7 +1713,21 @@ func (s *Server) handleReady(req *Request) Response {
 		}
 	}
 
-	data, _ := json.Marshal(issues)
+	// Build response with comment counts
+	issueIDs := make([]string, len(issues))
+	for i, issue := range issues {
+		issueIDs[i] = issue.ID
+	}
+	commentCounts, _ := store.GetCommentCounts(ctx, issueIDs)
+	issuesWithCounts := make([]*types.IssueWithCounts, len(issues))
+	for i, issue := range issues {
+		issuesWithCounts[i] = &types.IssueWithCounts{
+			Issue:        issue,
+			CommentCount: commentCounts[issue.ID],
+		}
+	}
+
+	data, _ := json.Marshal(issuesWithCounts)
 	return Response{
 		Success: true,
 		Data:    data,
@@ -1887,7 +2056,7 @@ func (s *Server) handleGateCreate(req *Request) Response {
 	// Create gate issue
 	gate := &types.Issue{
 		Title:     args.Title,
-		IssueType: types.TypeGate,
+		IssueType: "gate",
 		Status:    types.StatusOpen,
 		Priority:  1, // Gates are typically high priority
 		Assignee:  "deacon/",
@@ -1938,13 +2107,13 @@ func (s *Server) handleGateList(req *Request) Response {
 	ctx := s.reqCtx(req)
 
 	// Build filter for gates
-	gateType := types.TypeGate
+	gateType := types.IssueType("gate")
 	filter := types.IssueFilter{
 		IssueType: &gateType,
 	}
+	// By default, exclude closed gates (consistent with CLI behavior)
 	if !args.All {
-		openStatus := types.StatusOpen
-		filter.Status = &openStatus
+		filter.ExcludeStatus = []types.Status{types.StatusClosed}
 	}
 
 	gates, err := store.SearchIssues(ctx, "", filter)
@@ -2003,7 +2172,7 @@ func (s *Server) handleGateShow(req *Request) Response {
 			Error:   fmt.Sprintf("gate %s not found", gateID),
 		}
 	}
-	if gate.IssueType != types.TypeGate {
+	if gate.IssueType != "gate" {
 		return Response{
 			Success: false,
 			Error:   fmt.Sprintf("%s is not a gate (type: %s)", gateID, gate.IssueType),
@@ -2059,7 +2228,7 @@ func (s *Server) handleGateClose(req *Request) Response {
 			Error:   fmt.Sprintf("gate %s not found", gateID),
 		}
 	}
-	if gate.IssueType != types.TypeGate {
+	if gate.IssueType != "gate" {
 		return Response{
 			Success: false,
 			Error:   fmt.Sprintf("%s is not a gate (type: %s)", gateID, gate.IssueType),
@@ -2138,7 +2307,7 @@ func (s *Server) handleGateWait(req *Request) Response {
 			Error:   fmt.Sprintf("gate %s not found", gateID),
 		}
 	}
-	if gate.IssueType != types.TypeGate {
+	if gate.IssueType != "gate" {
 		return Response{
 			Success: false,
 			Error:   fmt.Sprintf("%s is not a gate (type: %s)", gateID, gate.IssueType),
@@ -2167,22 +2336,13 @@ func (s *Server) handleGateWait(req *Request) Response {
 	addedCount := len(newWaiters)
 
 	if addedCount > 0 {
-		// Update waiters using SQLite directly
-		sqliteStore, ok := store.(*sqlite.SQLiteStorage)
-		if !ok {
-			return Response{
-				Success: false,
-				Error:   "gate wait requires SQLite storage",
-			}
-		}
-
+		// Update waiters using the Storage interface
 		allWaiters := append(gate.Waiters, newWaiters...)
-		waitersJSON, _ := json.Marshal(allWaiters)
 
-		// Use raw SQL to update the waiters field
-		_, err = sqliteStore.UnderlyingDB().ExecContext(ctx, `UPDATE issues SET waiters = ?, updated_at = ? WHERE id = ?`,
-			string(waitersJSON), time.Now(), gateID)
-		if err != nil {
+		updates := map[string]interface{}{
+			"waiters": allWaiters,
+		}
+		if err := store.UpdateIssue(ctx, gateID, updates, s.reqActor(req)); err != nil {
 			return Response{
 				Success: false,
 				Error:   fmt.Sprintf("failed to add waiters: %v", err),

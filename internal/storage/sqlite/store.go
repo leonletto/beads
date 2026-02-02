@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -19,6 +20,43 @@ import (
 	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/tetratelabs/wazero"
 )
+
+// wslWindowsPathPattern matches WSL paths to Windows filesystems like /mnt/c/, /mnt/d/, etc.
+var wslWindowsPathPattern = regexp.MustCompile(`^/mnt/[a-zA-Z]/`)
+
+// wslNetworkPathPattern matches WSL network mount paths (Docker Desktop bind mounts, etc.)
+// Pattern: /mnt/wsl/* paths which are network filesystems that don't support WAL mode
+var wslNetworkPathPattern = regexp.MustCompile(`^/mnt/wsl/`)
+
+// isWSL2WindowsPath returns true if running under WSL2 and the path is on a Windows filesystem
+// or a WSL2 network mount (Docker Desktop bind mounts, etc.).
+// SQLite WAL mode doesn't work reliably across the WSL2/Windows boundary (GH#920) or on network mounts (GH#1224).
+func isWSL2WindowsPath(path string) bool {
+	// Check if we're running under WSL by examining /proc/version first (cheap check)
+	// WSL2 contains "microsoft" or "WSL" in the version string
+	data, err := os.ReadFile("/proc/version")
+	if err != nil {
+		return false // Not Linux or can't read - not WSL
+	}
+	version := strings.ToLower(string(data))
+	isWSL := strings.Contains(version, "microsoft") || strings.Contains(version, "wsl")
+	if !isWSL {
+		return false
+	}
+
+	// Now check if path is on a Windows filesystem or network mount
+	// Windows filesystem: /mnt/c/, /mnt/d/, etc.
+	if wslWindowsPathPattern.MatchString(path) {
+		return true
+	}
+
+	// Network filesystem: /mnt/wsl/* (Docker Desktop bind mounts, etc.)
+	if wslNetworkPathPattern.MatchString(path) {
+		return true
+	}
+
+	return false
+}
 
 // SQLiteStorage implements the Storage interface using SQLite
 type SQLiteStorage struct {
@@ -139,9 +177,15 @@ func NewWithTimeout(ctx context.Context, path string, busyTimeout time.Duration)
 	}
 
 	// For file-based databases, enable WAL mode once after opening the connection.
+	// Exception: On WSL2 with Windows filesystem (/mnt/c/), WAL doesn't work reliably
+	// due to shared-memory limitations across the 9P filesystem boundary (GH#920).
 	if !isInMemory {
-		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-			return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
+		journalMode := "WAL"
+		if isWSL2WindowsPath(path) {
+			journalMode = "DELETE" // Fallback for WSL2 Windows filesystem
+		}
+		if _, err := db.Exec("PRAGMA journal_mode=" + journalMode); err != nil {
+			return nil, fmt.Errorf("failed to enable %s mode: %w", journalMode, err)
 		}
 	}
 
@@ -447,7 +491,11 @@ func (s *SQLiteStorage) DisableFreshnessChecking() {
 // This should be called before read operations in daemon mode.
 func (s *SQLiteStorage) checkFreshness() {
 	if s.freshness != nil {
-		s.freshness.Check()
+		wasReplaced := s.freshness.Check()
+		if wasReplaced {
+			// Log that reconnection was attempted
+			debugPrintf("Database file replaced, reconnection triggered\n")
+		}
 	}
 }
 
@@ -458,42 +506,46 @@ func (s *SQLiteStorage) reconnect() error {
 	defer s.reconnectMu.Unlock()
 
 	if s.closed.Load() {
-		return nil
+		return fmt.Errorf("storage is closed")
 	}
 
-	// Close the old connection - log but continue since connection may be stale/invalid
-	if err := s.db.Close(); err != nil {
-		// Old connection might already be broken after file replacement - this is expected
-		debugPrintf("reconnect: close old connection: %v (continuing)\n", err)
-	}
-
-	// Open a new connection
+	// Open NEW connection FIRST (don't close old one yet)
 	db, err := sql.Open("sqlite3", s.connStr)
 	if err != nil {
-		return fmt.Errorf("failed to reconnect: %w", err)
+		return fmt.Errorf("failed to open new connection: %w", err)
 	}
 
-	// Restore connection pool settings
+	// Configure connection pool for new connection
 	s.configureConnectionPool(db)
 
-	// Re-enable WAL mode for file-based databases
+	// Re-enable WAL mode (or DELETE for WSL2)
 	isInMemory := s.dbPath == ":memory:" ||
 		(strings.HasPrefix(s.connStr, "file:") && strings.Contains(s.connStr, "mode=memory"))
 	if !isInMemory {
-		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		journalMode := "WAL"
+		if isWSL2WindowsPath(s.dbPath) {
+			journalMode = "DELETE" // Fallback for WSL2 Windows filesystem (GH#920)
+		}
+		if _, err := db.Exec("PRAGMA journal_mode=" + journalMode); err != nil {
 			_ = db.Close()
-			return fmt.Errorf("failed to enable WAL mode on reconnect: %w", err)
+			return fmt.Errorf("failed to enable %s mode: %w", journalMode, err)
 		}
 	}
 
-	// Test the new connection
+	// VALIDATE new connection works
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
-		return fmt.Errorf("failed to ping on reconnect: %w", err)
+		return fmt.Errorf("failed to ping new connection: %w", err)
 	}
 
-	// Swap in the new connection
+	// SUCCESS: Swap connections (old one can now fail safely)
+	oldDB := s.db
 	s.db = db
+
+	// Close old connection (errors are non-fatal since file may be deleted)
+	if err := oldDB.Close(); err != nil {
+		debugPrintf("reconnect: close old connection: %v (non-fatal)\n", err)
+	}
 
 	// Update freshness checker state
 	if s.freshness != nil {

@@ -5,26 +5,56 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/factory"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
 var showCmd = &cobra.Command{
-	Use:     "show [id...]",
+	Use:     "show [id...] [--id=<id>...]",
+	Aliases: []string{"view"},
 	GroupID: "issues",
 	Short:   "Show issue details",
-	Args:    cobra.MinimumNArgs(1),
+	Args:    cobra.ArbitraryArgs, // Allow zero positional args when --id is used
 	Run: func(cmd *cobra.Command, args []string) {
 		showThread, _ := cmd.Flags().GetBool("thread")
 		shortMode, _ := cmd.Flags().GetBool("short")
 		showRefs, _ := cmd.Flags().GetBool("refs")
+		showChildren, _ := cmd.Flags().GetBool("children")
+		asOfRef, _ := cmd.Flags().GetString("as-of")
+		idFlags, _ := cmd.Flags().GetStringArray("id")
+		localTime, _ := cmd.Flags().GetBool("local-time")
 		ctx := rootCtx
+
+		// Helper to format timestamp based on --local-time flag
+		formatTime := func(t time.Time) string {
+			if localTime {
+				t = t.Local()
+			}
+			return t.Format("2006-01-02 15:04")
+		}
+
+		// Merge --id flag values with positional args
+		// This allows IDs that look like flags (e.g., --xyz or gt--abc) to be passed safely
+		args = append(args, idFlags...)
+
+		// Validate that at least one ID is provided
+		if len(args) == 0 {
+			FatalErrorRespectJSON("at least one issue ID is required (use positional args or --id flag)")
+		}
+
+		// Handle --as-of flag: show issue at a specific point in history
+		if asOfRef != "" {
+			showIssueAsOf(ctx, args, asOfRef, shortMode)
+			return
+		}
 
 		// Check database freshness before reading
 		// Skip check when using daemon (daemon auto-imports on staleness)
@@ -83,6 +113,12 @@ var showCmd = &cobra.Command{
 			return
 		}
 
+		// Handle --children flag: show only children of this issue
+		if showChildren {
+			showIssueChildren(ctx, args, resolvedIDs, routedArgs, jsonOutput, shortMode)
+			return
+		}
+
 		// If daemon is running, use RPC (but fall back to direct mode for routed IDs)
 		if daemonClient != nil {
 			allDetails := []interface{}{}
@@ -116,10 +152,8 @@ var showCmd = &cobra.Command{
 					// Get labels and deps for JSON output
 					details := &types.IssueDetails{Issue: *issue}
 					details.Labels, _ = issueStore.GetLabels(ctx, issue.ID)
-					if sqliteStore, ok := issueStore.(*sqlite.SQLiteStorage); ok {
-						details.Dependencies, _ = sqliteStore.GetDependenciesWithMetadata(ctx, issue.ID)
-						details.Dependents, _ = sqliteStore.GetDependentsWithMetadata(ctx, issue.ID)
-					}
+					details.Dependencies, _ = issueStore.GetDependenciesWithMetadata(ctx, issue.ID)
+					details.Dependents, _ = issueStore.GetDependentsWithMetadata(ctx, issue.ID)
 					details.Comments, _ = issueStore.GetIssueComments(ctx, issue.ID)
 					// Compute parent from dependencies
 					for _, dep := range details.Dependencies {
@@ -131,14 +165,14 @@ var showCmd = &cobra.Command{
 					allDetails = append(allDetails, details)
 				} else {
 					if displayIdx > 0 {
-						fmt.Println("\n" + strings.Repeat("─", 60))
+						fmt.Println("\n" + ui.RenderMuted(strings.Repeat("─", 60)))
 					}
-					fmt.Printf("\n%s: %s\n", ui.RenderAccent(issue.ID), issue.Title)
-					fmt.Printf("Status: %s\n", issue.Status)
-					fmt.Printf("Priority: P%d\n", issue.Priority)
-					fmt.Printf("Type: %s\n", issue.IssueType)
+					// Tufte-aligned header: STATUS_ICON ID · Title   [Priority · STATUS]
+					fmt.Printf("\n%s\n", formatIssueHeader(issue))
+					// Metadata: Owner · Type | Created · Updated
+					fmt.Println(formatIssueMetadata(issue))
 					if issue.Description != "" {
-						fmt.Printf("\nDescription:\n%s\n", issue.Description)
+						fmt.Printf("\n%s\n%s\n", ui.RenderBold("DESCRIPTION"), ui.RenderMarkdown(issue.Description))
 					}
 					fmt.Println()
 					displayIdx++
@@ -188,45 +222,17 @@ var showCmd = &cobra.Command{
 					}
 
 					if displayIdx > 0 {
-						fmt.Println("\n" + strings.Repeat("─", 60))
+						fmt.Println("\n" + ui.RenderMuted(strings.Repeat("─", 60)))
 					}
 					displayIdx++
 
-					// Format output (same as direct mode below)
-					tierEmoji := ""
-					statusSuffix := ""
-					switch issue.CompactionLevel {
-					case 1:
-						tierEmoji = " 🗜️"
-						statusSuffix = " (compacted L1)"
-					case 2:
-						tierEmoji = " 📦"
-						statusSuffix = " (compacted L2)"
-					}
+					// Tufte-aligned header: STATUS_ICON ID · Title   [Priority · STATUS]
+					fmt.Printf("\n%s\n", formatIssueHeader(issue))
 
-					fmt.Printf("\n%s: %s%s\n", ui.RenderAccent(issue.ID), issue.Title, tierEmoji)
-					fmt.Printf("Status: %s%s\n", issue.Status, statusSuffix)
-					if issue.CloseReason != "" {
-						fmt.Printf("Close reason: %s\n", issue.CloseReason)
-					}
-					if issue.ClosedBySession != "" {
-						fmt.Printf("Closed by session: %s\n", issue.ClosedBySession)
-					}
-					fmt.Printf("Priority: P%d\n", issue.Priority)
-					fmt.Printf("Type: %s\n", issue.IssueType)
-					if issue.Assignee != "" {
-						fmt.Printf("Assignee: %s\n", issue.Assignee)
-					}
-					if issue.EstimatedMinutes != nil {
-						fmt.Printf("Estimated: %d minutes\n", *issue.EstimatedMinutes)
-					}
-					fmt.Printf("Created: %s\n", issue.CreatedAt.Format("2006-01-02 15:04"))
-					if issue.CreatedBy != "" {
-						fmt.Printf("Created by: %s\n", issue.CreatedBy)
-					}
-					fmt.Printf("Updated: %s\n", issue.UpdatedAt.Format("2006-01-02 15:04"))
+					// Metadata: Owner · Type | Created · Updated
+					fmt.Println(formatIssueMetadata(issue))
 
-					// Show compaction status
+					// Compaction info (if applicable)
 					if issue.CompactionLevel > 0 {
 						fmt.Println()
 						if issue.OriginalSize > 0 {
@@ -234,47 +240,76 @@ var showCmd = &cobra.Command{
 							saved := issue.OriginalSize - currentSize
 							if saved > 0 {
 								reduction := float64(saved) / float64(issue.OriginalSize) * 100
-								fmt.Printf("📊 Original: %d bytes | Compressed: %d bytes (%.0f%% reduction)\n",
+								fmt.Printf("📊 %d → %d bytes (%.0f%% reduction)\n",
 									issue.OriginalSize, currentSize, reduction)
 							}
 						}
-						tierEmoji2 := "🗜️"
-						if issue.CompactionLevel == 2 {
-							tierEmoji2 = "📦"
-						}
-						compactedDate := ""
-						if issue.CompactedAt != nil {
-							compactedDate = issue.CompactedAt.Format("2006-01-02")
-						}
-						fmt.Printf("%s Compacted: %s (Tier %d)\n", tierEmoji2, compactedDate, issue.CompactionLevel)
 					}
 
+					// Content sections
 					if issue.Description != "" {
-						fmt.Printf("\nDescription:\n%s\n", issue.Description)
+						fmt.Printf("\n%s\n%s\n", ui.RenderBold("DESCRIPTION"), ui.RenderMarkdown(issue.Description))
 					}
 					if issue.Design != "" {
-						fmt.Printf("\nDesign:\n%s\n", issue.Design)
+						fmt.Printf("\n%s\n%s\n", ui.RenderBold("DESIGN"), ui.RenderMarkdown(issue.Design))
 					}
 					if issue.Notes != "" {
-						fmt.Printf("\nNotes:\n%s\n", issue.Notes)
+						fmt.Printf("\n%s\n%s\n", ui.RenderBold("NOTES"), ui.RenderMarkdown(issue.Notes))
 					}
 					if issue.AcceptanceCriteria != "" {
-						fmt.Printf("\nAcceptance Criteria:\n%s\n", issue.AcceptanceCriteria)
+						fmt.Printf("\n%s\n%s\n", ui.RenderBold("ACCEPTANCE CRITERIA"), ui.RenderMarkdown(issue.AcceptanceCriteria))
 					}
 
 					if len(details.Labels) > 0 {
-						fmt.Printf("\nLabels: %v\n", details.Labels)
+						fmt.Printf("\n%s %s\n", ui.RenderBold("LABELS:"), strings.Join(details.Labels, ", "))
 					}
 
+					// Dependencies grouped by type with semantic colors
 					if len(details.Dependencies) > 0 {
-						fmt.Printf("\nDepends on (%d):\n", len(details.Dependencies))
+						var blocks, parent, related, discovered []*types.IssueWithDependencyMetadata
 						for _, dep := range details.Dependencies {
-							fmt.Printf("  → %s: %s [P%d]\n", dep.ID, dep.Title, dep.Priority)
+							switch dep.DependencyType {
+							case types.DepBlocks:
+								blocks = append(blocks, dep)
+							case types.DepParentChild:
+								parent = append(parent, dep)
+							case types.DepRelated:
+								related = append(related, dep)
+							case types.DepDiscoveredFrom:
+								discovered = append(discovered, dep)
+							default:
+								blocks = append(blocks, dep)
+							}
+						}
+
+						if len(parent) > 0 {
+							fmt.Printf("\n%s\n", ui.RenderBold("PARENT"))
+							for _, dep := range parent {
+								fmt.Println(formatDependencyLine("↑", dep))
+							}
+						}
+						if len(blocks) > 0 {
+							fmt.Printf("\n%s\n", ui.RenderBold("DEPENDS ON"))
+							for _, dep := range blocks {
+								fmt.Println(formatDependencyLine("→", dep))
+							}
+						}
+						if len(related) > 0 {
+							fmt.Printf("\n%s\n", ui.RenderBold("RELATED"))
+							for _, dep := range related {
+								fmt.Println(formatDependencyLine("↔", dep))
+							}
+						}
+						if len(discovered) > 0 {
+							fmt.Printf("\n%s\n", ui.RenderBold("DISCOVERED FROM"))
+							for _, dep := range discovered {
+								fmt.Println(formatDependencyLine("◊", dep))
+							}
 						}
 					}
 
+					// Dependents grouped by type with semantic colors
 					if len(details.Dependents) > 0 {
-						// Group by dependency type for clarity
 						var blocks, children, related, discovered []*types.IssueWithDependencyMetadata
 						for _, dep := range details.Dependents {
 							switch dep.DependencyType {
@@ -292,37 +327,38 @@ var showCmd = &cobra.Command{
 						}
 
 						if len(children) > 0 {
-							fmt.Printf("\nChildren (%d):\n", len(children))
+							fmt.Printf("\n%s\n", ui.RenderBold("CHILDREN"))
 							for _, dep := range children {
-								fmt.Printf("  ↳ %s: %s [P%d - %s]\n", dep.ID, dep.Title, dep.Priority, dep.Status)
+								fmt.Println(formatDependencyLine("↳", dep))
 							}
 						}
 						if len(blocks) > 0 {
-							fmt.Printf("\nBlocks (%d):\n", len(blocks))
+							fmt.Printf("\n%s\n", ui.RenderBold("BLOCKS"))
 							for _, dep := range blocks {
-								fmt.Printf("  ← %s: %s [P%d - %s]\n", dep.ID, dep.Title, dep.Priority, dep.Status)
+								fmt.Println(formatDependencyLine("←", dep))
 							}
 						}
 						if len(related) > 0 {
-							fmt.Printf("\nRelated (%d):\n", len(related))
+							fmt.Printf("\n%s\n", ui.RenderBold("RELATED"))
 							for _, dep := range related {
-								fmt.Printf("  ↔ %s: %s [P%d - %s]\n", dep.ID, dep.Title, dep.Priority, dep.Status)
+								fmt.Println(formatDependencyLine("↔", dep))
 							}
 						}
 						if len(discovered) > 0 {
-							fmt.Printf("\nDiscovered (%d):\n", len(discovered))
+							fmt.Printf("\n%s\n", ui.RenderBold("DISCOVERED"))
 							for _, dep := range discovered {
-								fmt.Printf("  ◊ %s: %s [P%d - %s]\n", dep.ID, dep.Title, dep.Priority, dep.Status)
+								fmt.Println(formatDependencyLine("◊", dep))
 							}
 						}
 					}
 
 					if len(details.Comments) > 0 {
-						fmt.Printf("\nComments (%d):\n", len(details.Comments))
+						fmt.Printf("\n%s\n", ui.RenderBold("COMMENTS"))
 						for _, comment := range details.Comments {
-							fmt.Printf("  [%s] %s\n", comment.Author, comment.CreatedAt.Format("2006-01-02 15:04"))
-							commentLines := strings.Split(comment.Text, "\n")
-							for _, line := range commentLines {
+							fmt.Printf("  %s %s\n", ui.RenderMuted(formatTime(comment.CreatedAt)), comment.Author)
+							rendered := ui.RenderMarkdown(comment.Text)
+							// TrimRight removes trailing newlines that Glamour adds, preventing extra blank lines
+							for _, line := range strings.Split(strings.TrimRight(rendered, "\n"), "\n") {
 								fmt.Printf("    %s\n", line)
 							}
 						}
@@ -380,20 +416,8 @@ var showCmd = &cobra.Command{
 				details.Labels, _ = issueStore.GetLabels(ctx, issue.ID)
 
 				// Get dependencies with metadata (dependency_type field)
-				if sqliteStore, ok := issueStore.(*sqlite.SQLiteStorage); ok {
-					details.Dependencies, _ = sqliteStore.GetDependenciesWithMetadata(ctx, issue.ID)
-					details.Dependents, _ = sqliteStore.GetDependentsWithMetadata(ctx, issue.ID)
-				} else {
-					// Fallback to regular methods without metadata for other storage backends
-					deps, _ := issueStore.GetDependencies(ctx, issue.ID)
-					for _, dep := range deps {
-						details.Dependencies = append(details.Dependencies, &types.IssueWithDependencyMetadata{Issue: *dep})
-					}
-					dependents, _ := issueStore.GetDependents(ctx, issue.ID)
-					for _, dependent := range dependents {
-						details.Dependents = append(details.Dependents, &types.IssueWithDependencyMetadata{Issue: *dependent})
-					}
-				}
+				details.Dependencies, _ = issueStore.GetDependenciesWithMetadata(ctx, issue.ID)
+				details.Dependents, _ = issueStore.GetDependentsWithMetadata(ctx, issue.ID)
 
 				details.Comments, _ = issueStore.GetIssueComments(ctx, issue.ID)
 				// Compute parent from dependencies
@@ -409,151 +433,137 @@ var showCmd = &cobra.Command{
 			}
 
 			if idx > 0 {
-				fmt.Println("\n" + strings.Repeat("─", 60))
+				fmt.Println("\n" + ui.RenderMuted(strings.Repeat("─", 60)))
 			}
 
-			// Add compaction emoji to title line
-			tierEmoji := ""
-			statusSuffix := ""
-			switch issue.CompactionLevel {
-			case 1:
-				tierEmoji = " 🗜️"
-				statusSuffix = " (compacted L1)"
-			case 2:
-				tierEmoji = " 📦"
-				statusSuffix = " (compacted L2)"
-			}
+			// Tufte-aligned header: STATUS_ICON ID · Title   [Priority · STATUS]
+			fmt.Printf("\n%s\n", formatIssueHeader(issue))
 
-			fmt.Printf("\n%s: %s%s\n", ui.RenderAccent(issue.ID), issue.Title, tierEmoji)
-			fmt.Printf("Status: %s%s\n", issue.Status, statusSuffix)
-			if issue.CloseReason != "" {
-				fmt.Printf("Close reason: %s\n", issue.CloseReason)
-			}
-			if issue.ClosedBySession != "" {
-				fmt.Printf("Closed by session: %s\n", issue.ClosedBySession)
-			}
-			fmt.Printf("Priority: P%d\n", issue.Priority)
-			fmt.Printf("Type: %s\n", issue.IssueType)
-			if issue.Assignee != "" {
-				fmt.Printf("Assignee: %s\n", issue.Assignee)
-			}
-			if issue.EstimatedMinutes != nil {
-				fmt.Printf("Estimated: %d minutes\n", *issue.EstimatedMinutes)
-			}
-			fmt.Printf("Created: %s\n", issue.CreatedAt.Format("2006-01-02 15:04"))
-			if issue.CreatedBy != "" {
-				fmt.Printf("Created by: %s\n", issue.CreatedBy)
-			}
-			fmt.Printf("Updated: %s\n", issue.UpdatedAt.Format("2006-01-02 15:04"))
+			// Metadata: Owner · Type | Created · Updated
+			fmt.Println(formatIssueMetadata(issue))
 
-			// Show compaction status footer
+			// Compaction info (if applicable)
 			if issue.CompactionLevel > 0 {
-				tierEmoji := "🗜️"
-				if issue.CompactionLevel == 2 {
-					tierEmoji = "📦"
-				}
-				tierName := fmt.Sprintf("Tier %d", issue.CompactionLevel)
-
 				fmt.Println()
 				if issue.OriginalSize > 0 {
 					currentSize := len(issue.Description) + len(issue.Design) + len(issue.Notes) + len(issue.AcceptanceCriteria)
 					saved := issue.OriginalSize - currentSize
 					if saved > 0 {
 						reduction := float64(saved) / float64(issue.OriginalSize) * 100
-						fmt.Printf("📊 Original: %d bytes | Compressed: %d bytes (%.0f%% reduction)\n",
+						fmt.Printf("📊 %d → %d bytes (%.0f%% reduction)\n",
 							issue.OriginalSize, currentSize, reduction)
 					}
 				}
-				compactedDate := ""
-				if issue.CompactedAt != nil {
-					compactedDate = issue.CompactedAt.Format("2006-01-02")
-				}
-				fmt.Printf("%s Compacted: %s (%s)\n", tierEmoji, compactedDate, tierName)
 			}
 
+			// Content sections
 			if issue.Description != "" {
-				fmt.Printf("\nDescription:\n%s\n", issue.Description)
+				fmt.Printf("\n%s\n%s\n", ui.RenderBold("DESCRIPTION"), ui.RenderMarkdown(issue.Description))
 			}
 			if issue.Design != "" {
-				fmt.Printf("\nDesign:\n%s\n", issue.Design)
+				fmt.Printf("\n%s\n%s\n", ui.RenderBold("DESIGN"), ui.RenderMarkdown(issue.Design))
 			}
 			if issue.Notes != "" {
-				fmt.Printf("\nNotes:\n%s\n", issue.Notes)
+				fmt.Printf("\n%s\n%s\n", ui.RenderBold("NOTES"), ui.RenderMarkdown(issue.Notes))
 			}
 			if issue.AcceptanceCriteria != "" {
-				fmt.Printf("\nAcceptance Criteria:\n%s\n", issue.AcceptanceCriteria)
+				fmt.Printf("\n%s\n%s\n", ui.RenderBold("ACCEPTANCE CRITERIA"), ui.RenderMarkdown(issue.AcceptanceCriteria))
 			}
 
 			// Show labels
 			labels, _ := issueStore.GetLabels(ctx, issue.ID)
 			if len(labels) > 0 {
-				fmt.Printf("\nLabels: %v\n", labels)
+				fmt.Printf("\n%s %s\n", ui.RenderBold("LABELS:"), strings.Join(labels, ", "))
 			}
 
-			// Show dependencies
-			deps, _ := issueStore.GetDependencies(ctx, issue.ID)
-			if len(deps) > 0 {
-				fmt.Printf("\nDepends on (%d):\n", len(deps))
-				for _, dep := range deps {
-					fmt.Printf("  → %s: %s [P%d]\n", dep.ID, dep.Title, dep.Priority)
+			// Show dependencies - grouped by dependency type for clarity
+			depsWithMeta, _ := issueStore.GetDependenciesWithMetadata(ctx, issue.ID)
+			if len(depsWithMeta) > 0 {
+				// Group by dependency type
+				var blocks, parent, related, discovered []*types.IssueWithDependencyMetadata
+				for _, dep := range depsWithMeta {
+					switch dep.DependencyType {
+					case types.DepBlocks:
+						blocks = append(blocks, dep)
+					case types.DepParentChild:
+						parent = append(parent, dep)
+					case types.DepRelated:
+						related = append(related, dep)
+					case types.DepDiscoveredFrom:
+						discovered = append(discovered, dep)
+					default:
+						blocks = append(blocks, dep) // Default to blocks
+					}
+				}
+
+				if len(parent) > 0 {
+					fmt.Printf("\n%s\n", ui.RenderBold("PARENT"))
+					for _, dep := range parent {
+						fmt.Println(formatDependencyLine("↑", dep))
+					}
+				}
+				if len(blocks) > 0 {
+					fmt.Printf("\n%s\n", ui.RenderBold("DEPENDS ON"))
+					for _, dep := range blocks {
+						fmt.Println(formatDependencyLine("→", dep))
+					}
+				}
+				if len(related) > 0 {
+					fmt.Printf("\n%s\n", ui.RenderBold("RELATED"))
+					for _, dep := range related {
+						fmt.Println(formatDependencyLine("↔", dep))
+					}
+				}
+				if len(discovered) > 0 {
+					fmt.Printf("\n%s\n", ui.RenderBold("DISCOVERED FROM"))
+					for _, dep := range discovered {
+						fmt.Println(formatDependencyLine("◊", dep))
+					}
 				}
 			}
 
 			// Show dependents - grouped by dependency type for clarity
-			// Use GetDependentsWithMetadata to get the dependency type
-			sqliteStore, ok := issueStore.(*sqlite.SQLiteStorage)
-			if ok {
-				dependentsWithMeta, _ := sqliteStore.GetDependentsWithMetadata(ctx, issue.ID)
-				if len(dependentsWithMeta) > 0 {
-					// Group by dependency type
-					var blocks, children, related, discovered []*types.IssueWithDependencyMetadata
-					for _, dep := range dependentsWithMeta {
-						switch dep.DependencyType {
-						case types.DepBlocks:
-							blocks = append(blocks, dep)
-						case types.DepParentChild:
-							children = append(children, dep)
-						case types.DepRelated:
-							related = append(related, dep)
-						case types.DepDiscoveredFrom:
-							discovered = append(discovered, dep)
-						default:
-							blocks = append(blocks, dep) // Default to blocks
-						}
-					}
-
-					if len(children) > 0 {
-						fmt.Printf("\nChildren (%d):\n", len(children))
-						for _, dep := range children {
-							fmt.Printf("  ↳ %s: %s [P%d - %s]\n", dep.ID, dep.Title, dep.Priority, dep.Status)
-						}
-					}
-					if len(blocks) > 0 {
-						fmt.Printf("\nBlocks (%d):\n", len(blocks))
-						for _, dep := range blocks {
-							fmt.Printf("  ← %s: %s [P%d - %s]\n", dep.ID, dep.Title, dep.Priority, dep.Status)
-						}
-					}
-					if len(related) > 0 {
-						fmt.Printf("\nRelated (%d):\n", len(related))
-						for _, dep := range related {
-							fmt.Printf("  ↔ %s: %s [P%d - %s]\n", dep.ID, dep.Title, dep.Priority, dep.Status)
-						}
-					}
-					if len(discovered) > 0 {
-						fmt.Printf("\nDiscovered (%d):\n", len(discovered))
-						for _, dep := range discovered {
-							fmt.Printf("  ◊ %s: %s [P%d - %s]\n", dep.ID, dep.Title, dep.Priority, dep.Status)
-						}
+			dependentsWithMeta, _ := issueStore.GetDependentsWithMetadata(ctx, issue.ID)
+			if len(dependentsWithMeta) > 0 {
+				// Group by dependency type
+				var blocks, children, related, discovered []*types.IssueWithDependencyMetadata
+				for _, dep := range dependentsWithMeta {
+					switch dep.DependencyType {
+					case types.DepBlocks:
+						blocks = append(blocks, dep)
+					case types.DepParentChild:
+						children = append(children, dep)
+					case types.DepRelated:
+						related = append(related, dep)
+					case types.DepDiscoveredFrom:
+						discovered = append(discovered, dep)
+					default:
+						blocks = append(blocks, dep) // Default to blocks
 					}
 				}
-			} else {
-				// Fallback for non-SQLite storage
-				dependents, _ := issueStore.GetDependents(ctx, issue.ID)
-				if len(dependents) > 0 {
-					fmt.Printf("\nBlocks (%d):\n", len(dependents))
-					for _, dep := range dependents {
-						fmt.Printf("  ← %s: %s [P%d - %s]\n", dep.ID, dep.Title, dep.Priority, dep.Status)
+
+				if len(children) > 0 {
+					fmt.Printf("\n%s\n", ui.RenderBold("CHILDREN"))
+					for _, dep := range children {
+						fmt.Println(formatDependencyLine("↳", dep))
+					}
+				}
+				if len(blocks) > 0 {
+					fmt.Printf("\n%s\n", ui.RenderBold("BLOCKS"))
+					for _, dep := range blocks {
+						fmt.Println(formatDependencyLine("←", dep))
+					}
+				}
+				if len(related) > 0 {
+					fmt.Printf("\n%s\n", ui.RenderBold("RELATED"))
+					for _, dep := range related {
+						fmt.Println(formatDependencyLine("↔", dep))
+					}
+				}
+				if len(discovered) > 0 {
+					fmt.Printf("\n%s\n", ui.RenderBold("DISCOVERED"))
+					for _, dep := range discovered {
+						fmt.Println(formatDependencyLine("◊", dep))
 					}
 				}
 			}
@@ -561,9 +571,14 @@ var showCmd = &cobra.Command{
 			// Show comments
 			comments, _ := issueStore.GetIssueComments(ctx, issue.ID)
 			if len(comments) > 0 {
-				fmt.Printf("\nComments (%d):\n", len(comments))
+				fmt.Printf("\n%s\n", ui.RenderBold("COMMENTS"))
 				for _, comment := range comments {
-					fmt.Printf("  [%s at %s]\n  %s\n\n", comment.Author, comment.CreatedAt.Format("2006-01-02 15:04"), comment.Text)
+					fmt.Printf("  %s %s\n", ui.RenderMuted(formatTime(comment.CreatedAt)), comment.Author)
+					rendered := ui.RenderMarkdown(comment.Text)
+					// TrimRight removes trailing newlines that Glamour adds, preventing extra blank lines
+					for _, line := range strings.Split(strings.TrimRight(rendered, "\n"), "\n") {
+						fmt.Printf("    %s\n", line)
+					}
 				}
 			}
 
@@ -587,10 +602,178 @@ var showCmd = &cobra.Command{
 
 
 // formatShortIssue returns a compact one-line representation of an issue
-// Format: <id> [<status>] P<priority> <type>: <title>
+// Format: STATUS_ICON ID PRIORITY [Type] Title
 func formatShortIssue(issue *types.Issue) string {
-	return fmt.Sprintf("%s [%s] P%d %s: %s",
-		issue.ID, issue.Status, issue.Priority, issue.IssueType, issue.Title)
+	statusIcon := ui.RenderStatusIcon(string(issue.Status))
+	priorityTag := ui.RenderPriority(issue.Priority)
+
+	// Type badge only for notable types
+	typeBadge := ""
+	switch issue.IssueType {
+	case "epic":
+		typeBadge = ui.TypeEpicStyle.Render("[epic]") + " "
+	case "bug":
+		typeBadge = ui.TypeBugStyle.Render("[bug]") + " "
+	}
+
+	// Closed issues: entire line is muted
+	if issue.Status == types.StatusClosed {
+		return fmt.Sprintf("%s %s %s %s%s",
+			statusIcon,
+			ui.RenderMuted(issue.ID),
+			ui.RenderMuted(fmt.Sprintf("● P%d", issue.Priority)),
+			ui.RenderMuted(string(issue.IssueType)),
+			ui.RenderMuted(" "+issue.Title))
+	}
+
+	return fmt.Sprintf("%s %s %s %s%s", statusIcon, issue.ID, priorityTag, typeBadge, issue.Title)
+}
+
+// formatIssueHeader returns the Tufte-aligned header line
+// Format: ID · Title   [Priority · STATUS]
+// All elements in bd show get semantic colors since focus is on one issue
+func formatIssueHeader(issue *types.Issue) string {
+	// Get status icon and style
+	statusIcon := ui.RenderStatusIcon(string(issue.Status))
+	statusStyle := ui.GetStatusStyle(string(issue.Status))
+	statusStr := statusStyle.Render(strings.ToUpper(string(issue.Status)))
+
+	// Priority with semantic color (includes ● icon)
+	priorityTag := ui.RenderPriority(issue.Priority)
+
+	// Type badge for notable types
+	typeBadge := ""
+	switch issue.IssueType {
+	case "epic":
+		typeBadge = " " + ui.TypeEpicStyle.Render("[EPIC]")
+	case "bug":
+		typeBadge = " " + ui.TypeBugStyle.Render("[BUG]")
+	}
+
+	// Compaction indicator
+	tierEmoji := ""
+	switch issue.CompactionLevel {
+	case 1:
+		tierEmoji = " 🗜️"
+	case 2:
+		tierEmoji = " 📦"
+	}
+
+	// Build header: STATUS_ICON ID · Title   [Priority · STATUS]
+	idStyled := ui.RenderAccent(issue.ID)
+	return fmt.Sprintf("%s %s%s · %s%s   [%s · %s]",
+		statusIcon, idStyled, typeBadge, issue.Title, tierEmoji, priorityTag, statusStr)
+}
+
+// formatIssueMetadata returns the metadata line(s) with grouped info
+// Format: Owner: user · Type: task
+//
+//	Created: 2026-01-06 · Updated: 2026-01-08
+func formatIssueMetadata(issue *types.Issue) string {
+	var lines []string
+
+	// Line 1: Owner/Assignee · Type
+	metaParts := []string{}
+	if issue.CreatedBy != "" {
+		metaParts = append(metaParts, fmt.Sprintf("Owner: %s", issue.CreatedBy))
+	}
+	if issue.Assignee != "" {
+		metaParts = append(metaParts, fmt.Sprintf("Assignee: %s", issue.Assignee))
+	}
+
+	// Type with semantic color
+	typeStr := string(issue.IssueType)
+	switch issue.IssueType {
+	case "epic":
+		typeStr = ui.TypeEpicStyle.Render("epic")
+	case "bug":
+		typeStr = ui.TypeBugStyle.Render("bug")
+	}
+	metaParts = append(metaParts, fmt.Sprintf("Type: %s", typeStr))
+
+	if len(metaParts) > 0 {
+		lines = append(lines, strings.Join(metaParts, " · "))
+	}
+
+	// Line 2: Created · Updated · Due/Defer
+	timeParts := []string{}
+	timeParts = append(timeParts, fmt.Sprintf("Created: %s", issue.CreatedAt.Format("2006-01-02")))
+	timeParts = append(timeParts, fmt.Sprintf("Updated: %s", issue.UpdatedAt.Format("2006-01-02")))
+
+	if issue.DueAt != nil {
+		timeParts = append(timeParts, fmt.Sprintf("Due: %s", issue.DueAt.Format("2006-01-02")))
+	}
+	if issue.DeferUntil != nil {
+		timeParts = append(timeParts, fmt.Sprintf("Deferred: %s", issue.DeferUntil.Format("2006-01-02")))
+	}
+	if len(timeParts) > 0 {
+		lines = append(lines, strings.Join(timeParts, " · "))
+	}
+
+	// Line 3: Close reason (if closed)
+	if issue.Status == types.StatusClosed && issue.CloseReason != "" {
+		lines = append(lines, ui.RenderMuted(fmt.Sprintf("Close reason: %s", issue.CloseReason)))
+	}
+
+	// Line 4: External ref (if exists)
+	if issue.ExternalRef != nil && *issue.ExternalRef != "" {
+		lines = append(lines, fmt.Sprintf("External: %s", *issue.ExternalRef))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// formatDependencyLine formats a single dependency with semantic colors
+// Closed items get entire row muted - the work is done, no need for attention
+func formatDependencyLine(prefix string, dep *types.IssueWithDependencyMetadata) string {
+	// Status icon (always rendered with semantic color)
+	statusIcon := ui.GetStatusIcon(string(dep.Status))
+
+	// Closed items: mute entire row since the work is complete
+	if dep.Status == types.StatusClosed {
+		return fmt.Sprintf("  %s %s %s: %s %s",
+			prefix, statusIcon,
+			ui.RenderMuted(dep.ID),
+			ui.RenderMuted(dep.Title),
+			ui.RenderMuted(fmt.Sprintf("● P%d", dep.Priority)))
+	}
+
+	// Active items: ID with status color, priority with semantic color
+	style := ui.GetStatusStyle(string(dep.Status))
+	idStr := style.Render(dep.ID)
+	priorityTag := ui.RenderPriority(dep.Priority)
+
+	// Type indicator for epics/bugs
+	typeStr := ""
+	if dep.IssueType == "epic" {
+		typeStr = ui.TypeEpicStyle.Render("(EPIC)") + " "
+	} else if dep.IssueType == "bug" {
+		typeStr = ui.TypeBugStyle.Render("(BUG)") + " "
+	}
+
+	return fmt.Sprintf("  %s %s %s: %s%s %s", prefix, statusIcon, idStr, typeStr, dep.Title, priorityTag)
+}
+
+// formatSimpleDependencyLine formats a dependency without metadata (fallback)
+// Closed items get entire row muted - the work is done, no need for attention
+func formatSimpleDependencyLine(prefix string, dep *types.Issue) string {
+	statusIcon := ui.GetStatusIcon(string(dep.Status))
+
+	// Closed items: mute entire row since the work is complete
+	if dep.Status == types.StatusClosed {
+		return fmt.Sprintf("  %s %s %s: %s %s",
+			prefix, statusIcon,
+			ui.RenderMuted(dep.ID),
+			ui.RenderMuted(dep.Title),
+			ui.RenderMuted(fmt.Sprintf("● P%d", dep.Priority)))
+	}
+
+	// Active items: use semantic colors
+	style := ui.GetStatusStyle(string(dep.Status))
+	idStr := style.Render(dep.ID)
+	priorityTag := ui.RenderPriority(dep.Priority)
+
+	return fmt.Sprintf("  %s %s %s: %s %s", prefix, statusIcon, idStr, dep.Title, priorityTag)
 }
 
 // showIssueRefs displays issues that reference the given issue(s), grouped by relationship type
@@ -600,20 +783,7 @@ func showIssueRefs(ctx context.Context, args []string, resolvedIDs []string, rou
 
 	// Process each issue
 	processIssue := func(issueID string, issueStore storage.Storage) error {
-		sqliteStore, ok := issueStore.(*sqlite.SQLiteStorage)
-		if !ok {
-			// Fallback: try to get dependents without metadata
-			dependents, err := issueStore.GetDependents(ctx, issueID)
-			if err != nil {
-				return err
-			}
-			for _, dep := range dependents {
-				allRefs[issueID] = append(allRefs[issueID], &types.IssueWithDependencyMetadata{Issue: *dep})
-			}
-			return nil
-		}
-
-		refs, err := sqliteStore.GetDependentsWithMetadata(ctx, issueID)
+		refs, err := issueStore.GetDependentsWithMetadata(ctx, issueID)
 		if err != nil {
 			return err
 		}
@@ -645,7 +815,8 @@ func showIssueRefs(ctx context.Context, args []string, resolvedIDs []string, rou
 	if daemonClient != nil {
 		for _, id := range resolvedIDs {
 			// Need to open direct connection for GetDependentsWithMetadata
-			dbStore, err := sqlite.New(ctx, dbPath)
+			// Use factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
+			dbStore, err := factory.NewFromConfig(ctx, filepath.Dir(dbPath))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 				continue
@@ -729,13 +900,23 @@ func showIssueRefs(ctx context.Context, args []string, resolvedIDs []string, rou
 }
 
 // displayRefGroup displays a group of references with a given type
+// Closed items get entire row muted - the work is done, no need for attention
 func displayRefGroup(depType types.DependencyType, refs []*types.IssueWithDependencyMetadata) {
 	// Get emoji for type
 	emoji := getRefTypeEmoji(depType)
 	fmt.Printf("\n  %s %s (%d):\n", emoji, depType, len(refs))
 
 	for _, ref := range refs {
-		// Color ID based on status
+		// Closed items: mute entire row since the work is complete
+		if ref.Status == types.StatusClosed {
+			fmt.Printf("    %s: %s %s\n",
+				ui.RenderMuted(ref.ID),
+				ui.RenderMuted(ref.Title),
+				ui.RenderMuted(fmt.Sprintf("[P%d - %s]", ref.Priority, ref.Status)))
+			continue
+		}
+
+		// Active items: color ID based on status
 		var idStr string
 		switch ref.Status {
 		case types.StatusOpen:
@@ -744,8 +925,6 @@ func displayRefGroup(depType types.DependencyType, refs []*types.IssueWithDepend
 			idStr = ui.StatusInProgressStyle.Render(ref.ID)
 		case types.StatusBlocked:
 			idStr = ui.StatusBlockedStyle.Render(ref.ID)
-		case types.StatusClosed:
-			idStr = ui.StatusClosedStyle.Render(ref.ID)
 		default:
 			idStr = ref.ID
 		}
@@ -789,6 +968,117 @@ func getRefTypeEmoji(depType types.DependencyType) string {
 	}
 }
 
+// showIssueChildren displays only the children of the specified issue(s)
+func showIssueChildren(ctx context.Context, args []string, resolvedIDs []string, routedArgs []string, jsonOut bool, shortMode bool) {
+	// Collect all children for all issues
+	allChildren := make(map[string][]*types.IssueWithDependencyMetadata)
+
+	// Process each issue to get its children
+	processIssue := func(issueID string, issueStore storage.Storage) error {
+		// Initialize entry so "no children" message can be shown
+		if _, exists := allChildren[issueID]; !exists {
+			allChildren[issueID] = []*types.IssueWithDependencyMetadata{}
+		}
+
+		// Get all dependents with metadata so we can filter for children
+		refs, err := issueStore.GetDependentsWithMetadata(ctx, issueID)
+		if err != nil {
+			return err
+		}
+		// Filter for only parent-child relationships
+		for _, ref := range refs {
+			if ref.DependencyType == types.DepParentChild {
+				allChildren[issueID] = append(allChildren[issueID], ref)
+			}
+		}
+		return nil
+	}
+
+	// Handle routed IDs via direct mode
+	for _, id := range routedArgs {
+		result, err := resolveAndGetIssueWithRouting(ctx, store, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
+			continue
+		}
+		if result == nil || result.Issue == nil {
+			if result != nil {
+				result.Close()
+			}
+			fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
+			continue
+		}
+		if err := processIssue(result.ResolvedID, result.Store); err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting children for %s: %v\n", id, err)
+		}
+		result.Close()
+	}
+
+	// Handle resolved IDs (daemon mode)
+	if daemonClient != nil {
+		for _, id := range resolvedIDs {
+			// Need to open direct connection for GetDependentsWithMetadata
+			// Use factory to respect backend configuration (bd-m2jr: SQLite fallback fix)
+			dbStore, err := factory.NewFromConfig(ctx, filepath.Dir(dbPath))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
+				continue
+			}
+			if err := processIssue(id, dbStore); err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting children for %s: %v\n", id, err)
+			}
+			_ = dbStore.Close()
+		}
+	} else {
+		// Direct mode - process each arg
+		for _, id := range args {
+			if containsStr(routedArgs, id) {
+				continue // Already processed above
+			}
+			result, err := resolveAndGetIssueWithRouting(ctx, store, id)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
+				continue
+			}
+			if result == nil || result.Issue == nil {
+				if result != nil {
+					result.Close()
+				}
+				fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
+				continue
+			}
+			if err := processIssue(result.ResolvedID, result.Store); err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting children for %s: %v\n", id, err)
+			}
+			result.Close()
+		}
+	}
+
+	// Output results
+	if jsonOut {
+		outputJSON(allChildren)
+		return
+	}
+
+	// Display children
+	for issueID, children := range allChildren {
+		if len(children) == 0 {
+			fmt.Printf("%s: No children found\n", ui.RenderAccent(issueID))
+			continue
+		}
+
+		fmt.Printf("%s Children of %s (%d):\n", ui.RenderAccent("↳"), issueID, len(children))
+		for _, child := range children {
+			if shortMode {
+				fmt.Printf("  %s\n", formatShortIssue(&child.Issue))
+			} else {
+				fmt.Println(formatDependencyLine("↳", child))
+			}
+		}
+		fmt.Println()
+	}
+}
+
 // containsStr checks if a string slice contains a value
 func containsStr(slice []string, val string) bool {
 	for _, s := range slice {
@@ -799,9 +1089,64 @@ func containsStr(slice []string, val string) bool {
 	return false
 }
 
+// showIssueAsOf displays issues as they existed at a specific commit or branch ref.
+// This requires a versioned storage backend (e.g., Dolt).
+func showIssueAsOf(ctx context.Context, args []string, ref string, shortMode bool) {
+	// Check if storage supports versioning
+	vs, ok := storage.AsVersioned(store)
+	if !ok {
+		FatalErrorRespectJSON("--as-of requires Dolt backend (current backend does not support versioning)")
+	}
+
+	var allIssues []*types.Issue
+	for idx, id := range args {
+		issue, err := vs.AsOf(ctx, id, ref)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error fetching %s as of %s: %v\n", id, ref, err)
+			continue
+		}
+		if issue == nil {
+			fmt.Fprintf(os.Stderr, "Issue %s did not exist at %s\n", id, ref)
+			continue
+		}
+
+		if shortMode {
+			fmt.Println(formatShortIssue(issue))
+			continue
+		}
+
+		if jsonOutput {
+			allIssues = append(allIssues, issue)
+			continue
+		}
+
+		if idx > 0 {
+			fmt.Println("\n" + ui.RenderMuted(strings.Repeat("-", 60)))
+		}
+
+		// Display header with ref indicator
+		fmt.Printf("\n%s (as of %s)\n", formatIssueHeader(issue), ui.RenderMuted(ref))
+		fmt.Println(formatIssueMetadata(issue))
+
+		if issue.Description != "" {
+			fmt.Printf("\n%s\n%s\n", ui.RenderBold("DESCRIPTION"), ui.RenderMarkdown(issue.Description))
+		}
+		fmt.Println()
+	}
+
+	if jsonOutput && len(allIssues) > 0 {
+		outputJSON(allIssues)
+	}
+}
+
 func init() {
 	showCmd.Flags().Bool("thread", false, "Show full conversation thread (for messages)")
 	showCmd.Flags().Bool("short", false, "Show compact one-line output per issue")
 	showCmd.Flags().Bool("refs", false, "Show issues that reference this issue (reverse lookup)")
+	showCmd.Flags().Bool("children", false, "Show only the children of this issue")
+	showCmd.Flags().String("as-of", "", "Show issue as it existed at a specific commit hash or branch (requires Dolt)")
+	showCmd.Flags().StringArray("id", nil, "Issue ID (use for IDs that look like flags, e.g., --id=gt--xyz)")
+	showCmd.Flags().Bool("local-time", false, "Show timestamps in local time instead of UTC")
+	showCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(showCmd)
 }

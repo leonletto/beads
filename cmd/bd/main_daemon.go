@@ -29,6 +29,7 @@ const (
 	FallbackConnectFailed     = "connect_failed"
 	FallbackHealthFailed      = "health_failed"
 	FallbackWorktreeSafety    = "worktree_safety"
+	FallbackSingleProcessOnly = "single_process_only"
 	cmdDaemon                 = "daemon"
 	cmdImport                 = "import"
 	statusHealthy             = "healthy"
@@ -64,17 +65,8 @@ func signalOrchestratorActivity() {
 	// Build command line from os.Args
 	cmdLine := strings.Join(os.Args, " ")
 
-	// Determine actor (use package-level var if set, else fall back to env)
-	actorName := actor
-	if actorName == "" {
-		if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
-			actorName = bdActor
-		} else if user := os.Getenv("USER"); user != "" {
-			actorName = user
-		} else {
-			actorName = "unknown"
-		}
-	}
+	// Determine actor (uses git config user.name as default)
+	actorName := getActorWithGit()
 
 	// Build activity signal
 	activity := struct {

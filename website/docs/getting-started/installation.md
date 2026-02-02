@@ -13,8 +13,7 @@ Complete installation guide for all platforms.
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Why Homebrew?**
@@ -30,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 ```
 
 The installer will:
-- Detect your platform (macOS/Linux, amd64/arm64)
+- Detect your platform (macOS/Linux/FreeBSD, amd64/arm64)
 - Install via `go install` if Go is available
 - Fall back to building from source if needed
 - Guide you through PATH setup if necessary
@@ -41,8 +40,7 @@ The installer will:
 
 **Via Homebrew** (recommended):
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Via go install**:
@@ -62,8 +60,7 @@ sudo mv bd /usr/local/bin/
 
 **Via Homebrew** (works on Linux too):
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Arch Linux** (AUR):
@@ -72,6 +69,18 @@ brew install bd
 yay -S beads-git
 # or
 paru -S beads-git
+```
+
+**Via go install**:
+```bash
+go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+### FreeBSD
+
+**Via quick install script**:
+```bash
+curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
 ```
 
 **Via go install**:
@@ -105,7 +114,7 @@ The recommended approach for Claude Code, Cursor, Windsurf, and other editors wi
 
 ```bash
 # 1. Install bd CLI (see Quick Install above)
-brew install bd
+brew install beads
 
 # 2. Initialize in your project
 cd your-project

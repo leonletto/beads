@@ -1,8 +1,37 @@
 # Agent Instructions
 
-See [CLAUDE.md](CLAUDE.md) for full instructions.
+See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full instructions.
 
 This file exists for compatibility with tools that look for AGENTS.md.
+
+## Key Sections
+
+- **Issue Tracking** - How to use bd for work management
+- **Development Guidelines** - Code standards and testing
+- **Visual Design System** - Status icons, colors, and semantic styling for CLI output
+
+## Visual Design Anti-Patterns
+
+**NEVER use emoji-style icons** (🔴🟠🟡🔵⚪) in CLI output. They cause cognitive overload.
+
+**ALWAYS use small Unicode symbols** with semantic colors:
+- Status: `○ ◐ ● ✓ ❄`
+- Priority: `● P0` (filled circle with color)
+
+See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full development guidelines.
+
+## Agent Warning: Interactive Commands
+
+**DO NOT use `bd edit`** - it opens an interactive editor ($EDITOR) which AI agents cannot use.
+
+Use `bd update` with flags instead:
+```bash
+bd update <id> --description "new description"
+bd update <id> --title "new title"
+bd update <id> --design "design notes"
+bd update <id> --notes "additional notes"
+bd update <id> --acceptance "acceptance criteria"
+```
 
 ## Landing the Plane (Session Completion)
 
@@ -16,7 +45,6 @@ This file exists for compatibility with tools that look for AGENTS.md.
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd sync
    git push
    git status  # MUST show "up to date with origin"
    ```

@@ -12,6 +12,18 @@ import (
 	"github.com/steveyegge/beads/internal/debug"
 )
 
+// Sync trigger constants define when sync operations occur.
+const (
+	// SyncTriggerPush triggers sync on git push operations.
+	SyncTriggerPush = "push"
+
+	// SyncTriggerChange triggers sync on every database change.
+	SyncTriggerChange = "change"
+
+	// SyncTriggerPull triggers import on git pull operations.
+	SyncTriggerPull = "pull"
+)
+
 var v *viper.Viper
 
 // Initialize sets up the viper configuration singleton
@@ -30,11 +42,36 @@ func Initialize() error {
 	//    This allows commands to work from subdirectories
 	cwd, err := os.Getwd()
 	if err == nil && !configFileSet {
+		// In the beads repo, `.beads/config.yaml` is tracked and may set sync.mode=dolt-native.
+		// In `go test` (especially for `cmd/bd`), we want to avoid unintentionally picking up
+		// the repo-local config, while still allowing tests to load config.yaml from temp repos.
+		//
+		// If BEADS_TEST_IGNORE_REPO_CONFIG is set, we will ignore the config at
+		// <module-root>/.beads/config.yaml (where module-root is the nearest parent containing go.mod).
+		ignoreRepoConfig := os.Getenv("BEADS_TEST_IGNORE_REPO_CONFIG") != ""
+		var moduleRoot string
+		if ignoreRepoConfig {
+			// Find module root by walking up to go.mod.
+			for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+				if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+					moduleRoot = dir
+					break
+				}
+			}
+		}
+
 		// Walk up parent directories to find .beads/config.yaml
 		for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
 			beadsDir := filepath.Join(dir, ".beads")
 			configPath := filepath.Join(beadsDir, "config.yaml")
 			if _, err := os.Stat(configPath); err == nil {
+				if ignoreRepoConfig && moduleRoot != "" {
+					// Only ignore the repo-local config (moduleRoot/.beads/config.yaml).
+					wantIgnore := filepath.Clean(configPath) == filepath.Clean(filepath.Join(moduleRoot, ".beads", "config.yaml"))
+					if wantIgnore {
+						continue
+					}
+				}
 				// Found .beads/config.yaml - set it explicitly
 				v.SetConfigFile(configPath)
 				configFileSet = true
@@ -69,7 +106,7 @@ func Initialize() error {
 	// Environment variables take precedence over config file
 	// E.g., BD_JSON, BD_NO_DAEMON, BD_ACTOR, BD_DB
 	v.SetEnvPrefix("BD")
-	
+
 	// Replace hyphens and dots with underscores for env var mapping
 	// This allows BD_NO_DAEMON to map to "no-daemon" config key
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
@@ -80,27 +117,33 @@ func Initialize() error {
 	v.SetDefault("no-daemon", false)
 	v.SetDefault("no-auto-flush", false)
 	v.SetDefault("no-auto-import", false)
+	v.SetDefault("events-export", false)
 	v.SetDefault("no-db", false)
 	v.SetDefault("db", "")
 	v.SetDefault("actor", "")
 	v.SetDefault("issue-prefix", "")
 	v.SetDefault("lock-timeout", "30s")
-	
+
 	// Additional environment variables (not prefixed with BD_)
 	// These are bound explicitly for backward compatibility
 	_ = v.BindEnv("flush-debounce", "BEADS_FLUSH_DEBOUNCE")
 	_ = v.BindEnv("auto-start-daemon", "BEADS_AUTO_START_DAEMON")
 	_ = v.BindEnv("identity", "BEADS_IDENTITY")
 	_ = v.BindEnv("remote-sync-interval", "BEADS_REMOTE_SYNC_INTERVAL")
-	
+
 	// Set defaults for additional settings
 	v.SetDefault("flush-debounce", "30s")
 	v.SetDefault("auto-start-daemon", true)
 	v.SetDefault("identity", "")
 	v.SetDefault("remote-sync-interval", "30s")
-	
+
+	// Dolt configuration defaults
+	// Controls whether beads should automatically create Dolt commits after write commands.
+	// Values: off | on
+	v.SetDefault("dolt.auto-commit", "on")
+
 	// Routing configuration defaults
-	v.SetDefault("routing.mode", "auto")
+	v.SetDefault("routing.mode", "")
 	v.SetDefault("routing.default", ".")
 	v.SetDefault("routing.maintainer", ".")
 	v.SetDefault("routing.contributor", "~/.beads-planning")
@@ -108,14 +151,40 @@ func Initialize() error {
 	// Sync configuration defaults (bd-4u8)
 	v.SetDefault("sync.require_confirmation_on_mass_delete", false)
 
+	// Sync mode configuration (hq-ew1mbr.3)
+	// See docs/CONFIG.md for detailed documentation
+	v.SetDefault("sync.mode", SyncModeGitPortable)  // git-portable | realtime | dolt-native | belt-and-suspenders
+	v.SetDefault("sync.export_on", SyncTriggerPush) // push | change
+	v.SetDefault("sync.import_on", SyncTriggerPull) // pull | change
+
+	// Conflict resolution configuration
+	v.SetDefault("conflict.strategy", ConflictStrategyNewest) // newest | ours | theirs | manual
+
+	// Federation configuration (optional Dolt remote)
+	v.SetDefault("federation.remote", "")      // e.g., dolthub://org/beads, gs://bucket/beads, s3://bucket/beads
+	v.SetDefault("federation.sovereignty", "") // T1 | T2 | T3 | T4 (empty = no restriction)
+
 	// Push configuration defaults
 	v.SetDefault("no-push", false)
 
 	// Create command defaults
 	v.SetDefault("create.require-description", false)
 
+	// Validation configuration defaults (bd-t7jq)
+	// Values: "warn" | "error" | "none"
+	// - "none": no validation (default, backwards compatible)
+	// - "warn": validate and print warnings but proceed
+	// - "error": validate and fail on missing sections
+	v.SetDefault("validation.on-create", "none")
+	v.SetDefault("validation.on-sync", "none")
+
+	// Hierarchy configuration defaults (GH#995)
+	// Maximum nesting depth for hierarchical IDs (e.g., bd-abc.1.2.3)
+	// Default matches types.MaxHierarchyDepth constant
+	v.SetDefault("hierarchy.max-depth", 3)
+
 	// Git configuration defaults (GH#600)
-	v.SetDefault("git.author", "")        // Override commit author (e.g., "beads-bot <beads@example.com>")
+	v.SetDefault("git.author", "")         // Override commit author (e.g., "beads-bot <beads@example.com>")
 	v.SetDefault("git.no-gpg-sign", false) // Disable GPG signing for beads commits
 
 	// Directory-aware label scoping (GH#541)
@@ -138,6 +207,13 @@ func Initialize() error {
 	}
 
 	return nil
+}
+
+// ResetForTesting clears the config state, allowing Initialize() to be called again.
+// This is intended for tests that need to change config.yaml between test steps.
+// WARNING: Not thread-safe. Only call from single-threaded test contexts.
+func ResetForTesting() {
+	v = nil
 }
 
 // ConfigSource represents where a configuration value came from
@@ -192,7 +268,10 @@ func GetValueSource(key string) ConfigSource {
 // CheckOverrides checks for configuration overrides and returns a list of detected overrides.
 // This is useful for informing users when env vars or flags override config file values.
 // flagOverrides is a map of key -> (flagValue, flagWasSet) for flags that were explicitly set.
-func CheckOverrides(flagOverrides map[string]struct{ Value interface{}; WasSet bool }) []ConfigOverride {
+func CheckOverrides(flagOverrides map[string]struct {
+	Value  interface{}
+	WasSet bool
+}) []ConfigOverride {
 	var overrides []ConfigOverride
 
 	for key, flagInfo := range flagOverrides {
@@ -345,6 +424,16 @@ func AllSettings() map[string]interface{} {
 	return v.AllSettings()
 }
 
+// ConfigFileUsed returns the path to the config file that was loaded.
+// Returns empty string if no config file was found or viper is not initialized.
+// This is useful for resolving relative paths from the config file's directory.
+func ConfigFileUsed() string {
+	if v == nil {
+		return ""
+	}
+	return v.ConfigFileUsed()
+}
+
 // GetStringSlice retrieves a string slice configuration value
 func GetStringSlice(key string) []string {
 	if v == nil {
@@ -436,13 +525,23 @@ func ResolveExternalProjectPath(projectName string) string {
 		return ""
 	}
 
-	// Expand relative paths from config file location or cwd
+	// Resolve relative paths from repo root (parent of .beads/), NOT CWD.
+	// This ensures paths like "../beads" in config resolve correctly
+	// when running from different directories or in daemon context.
 	if !filepath.IsAbs(path) {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return ""
+		// Config is at .beads/config.yaml, so go up twice to get repo root
+		configFile := ConfigFileUsed()
+		if configFile != "" {
+			repoRoot := filepath.Dir(filepath.Dir(configFile)) // .beads/config.yaml -> repo/
+			path = filepath.Join(repoRoot, path)
+		} else {
+			// Fallback: resolve from CWD (legacy behavior)
+			cwd, err := os.Getwd()
+			if err != nil {
+				return ""
+			}
+			path = filepath.Join(cwd, path)
 		}
-		path = filepath.Join(cwd, path)
 	}
 
 	// Verify path exists
@@ -486,4 +585,201 @@ func GetIdentity(flagValue string) string {
 	}
 
 	return "unknown"
+}
+
+// SyncConfig holds the sync mode configuration.
+type SyncConfig struct {
+	Mode     SyncMode // git-portable, realtime, dolt-native, belt-and-suspenders
+	ExportOn string   // push, change
+	ImportOn string   // pull, change
+}
+
+// GetSyncConfig returns the current sync configuration.
+func GetSyncConfig() SyncConfig {
+	return SyncConfig{
+		Mode:     GetSyncMode(),
+		ExportOn: GetString("sync.export_on"),
+		ImportOn: GetString("sync.import_on"),
+	}
+}
+
+// ConflictConfig holds the conflict resolution configuration.
+type ConflictConfig struct {
+	Strategy ConflictStrategy          // newest, ours, theirs, manual (default for all fields)
+	Fields   map[string]FieldStrategy  // Per-field strategy overrides
+}
+
+// GetConflictConfig returns the current conflict resolution configuration.
+func GetConflictConfig() ConflictConfig {
+	return ConflictConfig{
+		Strategy: GetConflictStrategy(),
+		Fields:   GetFieldStrategies(),
+	}
+}
+
+// GetFieldStrategies retrieves per-field conflict resolution strategies from config.
+// Returns a map of field name to strategy (e.g., {"labels": "union", "compaction_level": "max"}).
+// Invalid strategies are logged and skipped.
+//
+// Config key: conflict.fields
+// Example:
+//
+//	conflict:
+//	  strategy: newest
+//	  fields:
+//	    compaction_level: max
+//	    labels: union
+//	    waiters: union
+//	    estimated_minutes: manual
+func GetFieldStrategies() map[string]FieldStrategy {
+	result := make(map[string]FieldStrategy)
+	if v == nil {
+		return result
+	}
+
+	// Get the raw map from config
+	fieldsMap := v.GetStringMapString("conflict.fields")
+	if fieldsMap == nil {
+		return result
+	}
+
+	for field, strategyStr := range fieldsMap {
+		strategy := FieldStrategy(strings.ToLower(strings.TrimSpace(strategyStr)))
+		if !validFieldStrategies[strategy] {
+			logConfigWarning("Warning: invalid conflict.fields.%s strategy %q (valid: %s), skipping\n",
+				field, strategyStr, strings.Join(ValidFieldStrategies(), ", "))
+			continue
+		}
+		result[field] = strategy
+	}
+
+	return result
+}
+
+// GetFieldStrategy returns the merge strategy for a specific field.
+// Returns the per-field strategy if configured, otherwise returns "newest" (default).
+func GetFieldStrategy(field string) FieldStrategy {
+	fields := GetFieldStrategies()
+	if strategy, ok := fields[field]; ok {
+		return strategy
+	}
+	return FieldStrategyNewest // Default
+}
+
+// FederationConfig holds the federation (Dolt remote) configuration.
+type FederationConfig struct {
+	Remote      string      // dolthub://org/beads, gs://bucket/beads, s3://bucket/beads
+	Sovereignty Sovereignty // T1, T2, T3, T4
+}
+
+// GetFederationConfig returns the current federation configuration.
+func GetFederationConfig() FederationConfig {
+	return FederationConfig{
+		Remote:      GetString("federation.remote"),
+		Sovereignty: GetSovereignty(),
+	}
+}
+
+// IsSyncModeValid checks if the given sync mode string is valid.
+func IsSyncModeValid(mode string) bool {
+	return validSyncModes[SyncMode(mode)]
+}
+
+// IsConflictStrategyValid checks if the given conflict strategy string is valid.
+func IsConflictStrategyValid(strategy string) bool {
+	return validConflictStrategies[ConflictStrategy(strategy)]
+}
+
+// IsSovereigntyValid checks if the given sovereignty tier string is valid.
+// Note: empty string is valid (means no restriction).
+func IsSovereigntyValid(sovereignty string) bool {
+	if sovereignty == "" {
+		return true
+	}
+	return validSovereigntyTiers[Sovereignty(sovereignty)]
+}
+
+// ShouldExportOnChange returns true if sync.export_on is set to "change".
+func ShouldExportOnChange() bool {
+	return GetString("sync.export_on") == SyncTriggerChange
+}
+
+// ShouldImportOnChange returns true if sync.import_on is set to "change".
+func ShouldImportOnChange() bool {
+	return GetString("sync.import_on") == SyncTriggerChange
+}
+
+// NeedsDoltRemote returns true if the sync mode requires a Dolt remote.
+func NeedsDoltRemote() bool {
+	mode := GetSyncMode()
+	return mode == SyncModeDoltNative || mode == SyncModeBeltAndSuspenders
+}
+
+// NeedsJSONL returns true if the sync mode requires JSONL export.
+func NeedsJSONL() bool {
+	mode := GetSyncMode()
+	return mode == SyncModeGitPortable || mode == SyncModeRealtime || mode == SyncModeBeltAndSuspenders
+}
+
+// GetCustomTypesFromYAML retrieves custom issue types from config.yaml.
+// This is used as a fallback when the database doesn't have types.custom set yet
+// (e.g., during bd init auto-import before the database is fully configured).
+// Returns nil if no custom types are configured in config.yaml.
+func GetCustomTypesFromYAML() []string {
+	return getConfigList("types.custom")
+}
+
+// GetCustomStatusesFromYAML retrieves custom statuses from config.yaml.
+// This is used as a fallback when the database doesn't have status.custom set yet
+// or when the database connection is temporarily unavailable.
+// Returns nil if no custom statuses are configured in config.yaml.
+func GetCustomStatusesFromYAML() []string {
+	return getConfigList("status.custom")
+}
+
+// ===== Agent Role Configuration =====
+// These functions return agent role types from config.yaml for agent ID parsing.
+// Each role category has different parsing semantics:
+//   - Town-level: <prefix>-<role> (singleton, no rig)
+//   - Rig-level: <prefix>-<rig>-<role> (singleton per rig)
+//   - Named: <prefix>-<rig>-<role>-<name> (multiple per rig)
+
+// GetTownLevelRoles returns roles that are town-level singletons.
+// These roles have no rig association and appear as: <prefix>-<role>
+func GetTownLevelRoles() []string {
+	return getConfigList("agent_roles.town_level")
+}
+
+// GetRigLevelRoles returns roles that are rig-level singletons.
+// These roles have one instance per rig: <prefix>-<rig>-<role>
+func GetRigLevelRoles() []string {
+	return getConfigList("agent_roles.rig_level")
+}
+
+// GetNamedRoles returns roles that can have multiple named instances per rig.
+// These roles include a name suffix: <prefix>-<rig>-<role>-<name>
+func GetNamedRoles() []string {
+	return getConfigList("agent_roles.named")
+}
+
+// getConfigList is a helper that retrieves a comma-separated list from config.yaml.
+func getConfigList(key string) []string {
+	if v == nil {
+		return nil
+	}
+
+	value := v.GetString(key)
+	if value == "" {
+		return nil
+	}
+
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }

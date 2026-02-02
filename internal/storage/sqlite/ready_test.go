@@ -1513,6 +1513,140 @@ func TestCheckExternalDepInvalidFormats(t *testing.T) {
 	}
 }
 
+// TestCheckExternalDepsBatching verifies that CheckExternalDeps correctly
+// batches multiple refs to the same project and deduplicates refs (bd-687v).
+func TestCheckExternalDepsBatching(t *testing.T) {
+	ctx := context.Background()
+
+	// Initialize config (required for config.Set to work)
+	if err := config.Initialize(); err != nil {
+		t.Fatalf("failed to initialize config: %v", err)
+	}
+
+	// Create external project directory with beads database
+	externalDir, err := os.MkdirTemp("", "beads-batch-test-*")
+	if err != nil {
+		t.Fatalf("failed to create external temp dir: %v", err)
+	}
+	defer os.RemoveAll(externalDir)
+
+	// Create .beads directory and config
+	beadsDir := filepath.Join(externalDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("failed to create beads dir: %v", err)
+	}
+	cfg := configfile.DefaultConfig()
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	// Create external database
+	externalDBPath := filepath.Join(beadsDir, "beads.db")
+	externalStore, err := New(ctx, externalDBPath)
+	if err != nil {
+		t.Fatalf("failed to create external store: %v", err)
+	}
+
+	if err := externalStore.SetConfig(ctx, "issue_prefix", "ext"); err != nil {
+		t.Fatalf("failed to set issue_prefix: %v", err)
+	}
+
+	// Ship capability "cap1" (closed issue with provides:cap1 label)
+	cap1Issue := &types.Issue{
+		ID:        "ext-cap1",
+		Title:     "Capability 1",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeFeature,
+	}
+	if err := externalStore.CreateIssue(ctx, cap1Issue, "test-user"); err != nil {
+		t.Fatalf("failed to create cap1 issue: %v", err)
+	}
+	if err := externalStore.AddLabel(ctx, cap1Issue.ID, "provides:cap1", "test-user"); err != nil {
+		t.Fatalf("failed to add provides:cap1 label: %v", err)
+	}
+	if err := externalStore.CloseIssue(ctx, cap1Issue.ID, "Shipped", "test-user", ""); err != nil {
+		t.Fatalf("failed to close cap1 issue: %v", err)
+	}
+
+	// Ship capability "cap2"
+	cap2Issue := &types.Issue{
+		ID:        "ext-cap2",
+		Title:     "Capability 2",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeFeature,
+	}
+	if err := externalStore.CreateIssue(ctx, cap2Issue, "test-user"); err != nil {
+		t.Fatalf("failed to create cap2 issue: %v", err)
+	}
+	if err := externalStore.AddLabel(ctx, cap2Issue.ID, "provides:cap2", "test-user"); err != nil {
+		t.Fatalf("failed to add provides:cap2 label: %v", err)
+	}
+	if err := externalStore.CloseIssue(ctx, cap2Issue.ID, "Shipped", "test-user", ""); err != nil {
+		t.Fatalf("failed to close cap2 issue: %v", err)
+	}
+
+	// Close to checkpoint WAL before read-only access
+	externalStore.Close()
+
+	// Configure external_projects
+	oldProjects := config.GetExternalProjects()
+	t.Cleanup(func() {
+		if oldProjects != nil {
+			config.Set("external_projects", oldProjects)
+		} else {
+			config.Set("external_projects", map[string]string{})
+		}
+	})
+	config.Set("external_projects", map[string]string{
+		"batch-test": externalDir,
+	})
+
+	// Test: Check multiple refs including duplicates and mixed satisfied/unsatisfied
+	refs := []string{
+		"external:batch-test:cap1",           // satisfied
+		"external:batch-test:cap2",           // satisfied
+		"external:batch-test:cap3",           // NOT satisfied
+		"external:batch-test:cap1",           // duplicate - should still work
+		"external:unconfigured-project:cap1", // unconfigured project
+		"invalid-ref",                        // invalid format
+	}
+
+	statuses := CheckExternalDeps(ctx, refs)
+
+	// Verify we got results for all unique refs (5 unique, since cap1 appears twice)
+	expectedUnique := 5
+	if len(statuses) != expectedUnique {
+		t.Errorf("Expected %d unique statuses, got %d", expectedUnique, len(statuses))
+	}
+
+	// cap1 should be satisfied
+	if s := statuses["external:batch-test:cap1"]; s == nil || !s.Satisfied {
+		t.Error("Expected external:batch-test:cap1 to be satisfied")
+	}
+
+	// cap2 should be satisfied
+	if s := statuses["external:batch-test:cap2"]; s == nil || !s.Satisfied {
+		t.Error("Expected external:batch-test:cap2 to be satisfied")
+	}
+
+	// cap3 should NOT be satisfied
+	if s := statuses["external:batch-test:cap3"]; s == nil || s.Satisfied {
+		t.Error("Expected external:batch-test:cap3 to be unsatisfied")
+	}
+
+	// unconfigured project should NOT be satisfied
+	if s := statuses["external:unconfigured-project:cap1"]; s == nil || s.Satisfied {
+		t.Error("Expected external:unconfigured-project:cap1 to be unsatisfied")
+	}
+
+	// invalid ref should NOT be satisfied
+	if s := statuses["invalid-ref"]; s == nil || s.Satisfied {
+		t.Error("Expected invalid-ref to be unsatisfied")
+	}
+}
+
 // TestGetNewlyUnblockedByClose tests the --suggest-next functionality (GH#679)
 func TestGetNewlyUnblockedByClose(t *testing.T) {
 	env := newTestEnv(t)
@@ -1720,4 +1854,179 @@ func TestParentIDEmptyParent(t *testing.T) {
 	if len(ready) != 0 {
 		t.Fatalf("Expected 0 ready issues for empty parent, got %d", len(ready))
 	}
+}
+
+// TestIsBlocked tests the IsBlocked method (GH#962)
+func TestIsBlocked(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	// Create issues:
+	// issue1: open, no dependencies → NOT BLOCKED
+	// issue2: open, depends on issue1 (open) → BLOCKED by issue1
+	// issue3: open, depends on issue4 (closed) → NOT BLOCKED (blocker is closed)
+	issue1 := env.CreateIssue("Open No Deps")
+	issue2 := env.CreateIssue("Blocked by open")
+	issue3 := env.CreateIssue("Blocked by closed")
+	issue4 := env.CreateIssue("Will be closed")
+
+	env.AddDep(issue2, issue1) // issue2 depends on issue1 (open)
+	env.AddDep(issue3, issue4) // issue3 depends on issue4
+
+	env.Close(issue4, "Done") // Close issue4
+
+	// Test issue1: not blocked
+	blocked, blockers, err := env.Store.IsBlocked(ctx, issue1.ID)
+	if err != nil {
+		t.Fatalf("IsBlocked failed: %v", err)
+	}
+	if blocked {
+		t.Errorf("Expected issue1 to NOT be blocked, got blocked=true with blockers=%v", blockers)
+	}
+
+	// Test issue2: blocked by issue1
+	blocked, blockers, err = env.Store.IsBlocked(ctx, issue2.ID)
+	if err != nil {
+		t.Fatalf("IsBlocked failed: %v", err)
+	}
+	if !blocked {
+		t.Error("Expected issue2 to be blocked")
+	}
+	if len(blockers) != 1 || blockers[0] != issue1.ID {
+		t.Errorf("Expected blockers=[%s], got %v", issue1.ID, blockers)
+	}
+
+	// Test issue3: not blocked (issue4 is closed)
+	blocked, blockers, err = env.Store.IsBlocked(ctx, issue3.ID)
+	if err != nil {
+		t.Fatalf("IsBlocked failed: %v", err)
+	}
+	if blocked {
+		t.Errorf("Expected issue3 to NOT be blocked (blocker is closed), got blocked=true with blockers=%v", blockers)
+	}
+}
+
+// TestGetReadyWorkExcludesMolSteps tests that molecule steps (IDs containing -mol-) are
+// excluded from bd ready by default, but included when filtering by explicit type.
+func TestGetReadyWorkExcludesMolSteps(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Create regular tasks
+	regularTask := env.CreateIssue("Regular task")
+
+	// Create molecule steps (IDs contain -mol-)
+	molStep1 := env.CreateIssueWithID("bd-mol-abc", "Mol step 1")
+	molStep2 := env.CreateIssueWithID("bd-mol-xyz", "Mol step 2")
+
+	// Default query should exclude mol steps
+	ready := env.GetReadyWork(types.WorkFilter{})
+	readyIDs := make(map[string]bool)
+	for _, issue := range ready {
+		readyIDs[issue.ID] = true
+	}
+
+	// Regular task should be included
+	if !readyIDs[regularTask.ID] {
+		t.Errorf("Expected regular task %s to be in ready work", regularTask.ID)
+	}
+
+	// Mol steps should be excluded
+	if readyIDs[molStep1.ID] {
+		t.Errorf("Expected mol step %s to be EXCLUDED from ready work by default", molStep1.ID)
+	}
+	if readyIDs[molStep2.ID] {
+		t.Errorf("Expected mol step %s to be EXCLUDED from ready work by default", molStep2.ID)
+	}
+
+	// Explicit type=task filter should include mol steps
+	readyWithType := env.GetReadyWork(types.WorkFilter{Type: "task"})
+	readyWithTypeIDs := make(map[string]bool)
+	for _, issue := range readyWithType {
+		readyWithTypeIDs[issue.ID] = true
+	}
+
+	// All tasks should be included when filtering by type
+	if !readyWithTypeIDs[regularTask.ID] {
+		t.Errorf("Expected regular task %s to be in ready work with --type=task", regularTask.ID)
+	}
+	if !readyWithTypeIDs[molStep1.ID] {
+		t.Errorf("Expected mol step %s to be INCLUDED with --type=task filter", molStep1.ID)
+	}
+	if !readyWithTypeIDs[molStep2.ID] {
+		t.Errorf("Expected mol step %s to be INCLUDED with --type=task filter", molStep2.ID)
+	}
+}
+
+// TestGetReadyWorkExcludeIDPatternsConfig tests custom exclusion patterns via config.
+func TestGetReadyWorkExcludeIDPatternsConfig(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := env.Ctx
+
+	// Create issues with various ID patterns
+	regularTask := env.CreateIssue("Regular task")
+	molStep := env.CreateIssueWithID("bd-mol-abc", "Mol step")
+	roleStep := env.CreateIssueWithID("bd-role-xyz", "Role step")
+	wispStep := env.CreateIssueWithID("bd-wisp-123", "Wisp step")
+
+	// Default config excludes -mol- and -wisp-
+	ready := env.GetReadyWork(types.WorkFilter{})
+	readyIDs := make(map[string]bool)
+	for _, issue := range ready {
+		readyIDs[issue.ID] = true
+	}
+
+	if !readyIDs[regularTask.ID] {
+		t.Errorf("Expected regular task to be included")
+	}
+	if readyIDs[molStep.ID] {
+		t.Errorf("Expected mol step to be excluded by default")
+	}
+	if readyIDs[wispStep.ID] {
+		t.Errorf("Expected wisp step to be excluded by default")
+	}
+	if !readyIDs[roleStep.ID] {
+		t.Errorf("Expected role step to be included (not in default patterns)")
+	}
+
+	// Configure custom patterns to also exclude -role-
+	if err := env.Store.SetConfig(ctx, ExcludeIDPatternsConfigKey, "-mol-,-wisp-,-role-"); err != nil {
+		t.Fatalf("SetConfig failed: %v", err)
+	}
+
+	ready2 := env.GetReadyWork(types.WorkFilter{})
+	readyIDs2 := make(map[string]bool)
+	for _, issue := range ready2 {
+		readyIDs2[issue.ID] = true
+	}
+
+	if !readyIDs2[regularTask.ID] {
+		t.Errorf("Expected regular task to be included with custom config")
+	}
+	if readyIDs2[molStep.ID] {
+		t.Errorf("Expected mol step to be excluded with custom config")
+	}
+	if readyIDs2[wispStep.ID] {
+		t.Errorf("Expected wisp step to be excluded with custom config")
+	}
+	if readyIDs2[roleStep.ID] {
+		t.Errorf("Expected role step to be excluded with custom config")
+	}
+
+	// IncludeMolSteps should bypass all pattern exclusions
+	ready3 := env.GetReadyWork(types.WorkFilter{IncludeMolSteps: true})
+	readyIDs3 := make(map[string]bool)
+	for _, issue := range ready3 {
+		readyIDs3[issue.ID] = true
+	}
+
+	if !readyIDs3[regularTask.ID] {
+		t.Errorf("Expected regular task with IncludeMolSteps")
+	}
+	if !readyIDs3[molStep.ID] {
+		t.Errorf("Expected mol step with IncludeMolSteps: true")
+	}
+	if !readyIDs3[roleStep.ID] {
+		t.Errorf("Expected role step with IncludeMolSteps: true")
+	}
+	// Note: wisp step is excluded by ephemeral flag, not pattern, so it stays excluded
 }

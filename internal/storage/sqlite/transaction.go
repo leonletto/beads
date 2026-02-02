@@ -48,8 +48,9 @@ func (s *SQLiteStorage) RunInTransaction(ctx context.Context, fn func(tx storage
 	defer func() { _ = conn.Close() }()
 
 	// Start IMMEDIATE transaction to acquire write lock early.
-	// Use retry logic with exponential backoff to handle SQLITE_BUSY
-	if err := beginImmediateWithRetry(ctx, conn, 5, 10*time.Millisecond); err != nil {
+	// BEGIN IMMEDIATE prevents deadlocks by acquiring the write lock upfront.
+	// The connection's busy_timeout pragma (30s) handles retries if locked.
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
@@ -91,10 +92,14 @@ func (s *SQLiteStorage) RunInTransaction(ctx context.Context, fn func(tx storage
 
 // CreateIssue creates a new issue within the transaction.
 func (t *sqliteTxStorage) CreateIssue(ctx context.Context, issue *types.Issue, actor string) error {
-	// Fetch custom statuses for validation
+	// Fetch custom statuses and types for validation
 	customStatuses, err := t.GetCustomStatuses(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get custom statuses: %w", err)
+	}
+	customTypes, err := t.GetCustomTypes(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get custom types: %w", err)
 	}
 
 	// Set timestamps first so defensive fixes can use them
@@ -127,8 +132,8 @@ func (t *sqliteTxStorage) CreateIssue(ctx context.Context, issue *types.Issue, a
 		issue.DeletedAt = &deletedAt
 	}
 
-	// Validate issue before creating (with custom status support)
-	if err := issue.ValidateWithCustomStatuses(customStatuses); err != nil {
+	// Validate issue before creating (with custom status and type support)
+	if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
@@ -147,10 +152,16 @@ func (t *sqliteTxStorage) CreateIssue(ctx context.Context, issue *types.Issue, a
 		return fmt.Errorf("failed to get config: %w", err)
 	}
 
-	// Use IDPrefix override if set, combined with config prefix
-	// e.g., configPrefix="bd" + IDPrefix="wisp" → "bd-wisp"
+	// Determine prefix for ID generation and validation:
+	// 1. PrefixOverride completely replaces config prefix (for cross-rig creation)
+	// 2. IDPrefix appends to config prefix (e.g., "bd" + "wisp" → "bd-wisp")
+	// 3. Otherwise use config prefix as-is
 	prefix := configPrefix
-	if issue.IDPrefix != "" {
+	skipPrefixValidation := false
+	if issue.PrefixOverride != "" {
+		prefix = issue.PrefixOverride
+		skipPrefixValidation = true // Caller explicitly specified prefix, skip validation
+	} else if issue.IDPrefix != "" {
 		prefix = configPrefix + "-" + issue.IDPrefix
 	}
 
@@ -164,8 +175,11 @@ func (t *sqliteTxStorage) CreateIssue(ctx context.Context, issue *types.Issue, a
 		issue.ID = generatedID
 	} else {
 		// Validate that explicitly provided ID matches the configured prefix
-		if err := ValidateIssueIDPrefix(issue.ID, prefix); err != nil {
-			return fmt.Errorf("failed to validate issue ID prefix: %w", err)
+		// Skip validation when PrefixOverride is set (cross-rig creation)
+		if !skipPrefixValidation {
+			if err := ValidateIssueIDPrefix(issue.ID, prefix); err != nil {
+				return fmt.Errorf("failed to validate issue ID prefix: %w", err)
+			}
 		}
 
 		// For hierarchical IDs (bd-a3f8e9.1), ensure parent exists
@@ -183,8 +197,10 @@ func (t *sqliteTxStorage) CreateIssue(ctx context.Context, issue *types.Issue, a
 		}
 	}
 
-	// Insert issue
-	if err := insertIssue(ctx, t.conn, issue); err != nil {
+	// Insert issue using strict mode (fails on duplicates)
+	// GH#956: Use insertIssueStrict instead of insertIssue to prevent FK constraint errors
+	// from silent INSERT OR IGNORE failures under concurrent load.
+	if err := insertIssueStrict(ctx, t.conn, issue); err != nil {
 		return fmt.Errorf("failed to insert issue: %w", err)
 	}
 
@@ -207,13 +223,17 @@ func (t *sqliteTxStorage) CreateIssues(ctx context.Context, issues []*types.Issu
 		return nil
 	}
 
-	// Fetch custom statuses for validation
+	// Fetch custom statuses and types for validation
 	customStatuses, err := t.GetCustomStatuses(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get custom statuses: %w", err)
 	}
+	customTypes, err := t.GetCustomTypes(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get custom types: %w", err)
+	}
 
-	// Validate and prepare all issues first (with custom status support)
+	// Validate and prepare all issues first (with custom status and type support)
 	now := time.Now()
 	for _, issue := range issues {
 		// Set timestamps first so defensive fixes can use them
@@ -245,7 +265,7 @@ func (t *sqliteTxStorage) CreateIssues(ctx context.Context, issues []*types.Issu
 			issue.DeletedAt = &deletedAt
 		}
 
-		if err := issue.ValidateWithCustomStatuses(customStatuses); err != nil {
+		if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
 			return fmt.Errorf("validation failed for issue: %w", err)
 		}
 		if issue.ContentHash == "" {
@@ -286,8 +306,16 @@ func (t *sqliteTxStorage) CreateIssues(ctx context.Context, issues []*types.Issu
 		seenIDs[issue.ID] = true
 	}
 
-	// Insert all issues
-	if err := insertIssues(ctx, t.conn, issues); err != nil {
+	// GH#956: Check for conflicts with existing IDs in database before inserting.
+	// This prevents duplicates from causing FK constraint failures when recording events.
+	if err := checkForExistingIDs(ctx, t.conn, issues); err != nil {
+		return err
+	}
+
+	// Insert all issues using strict mode (fails on duplicates)
+	// GH#956: Use insertIssuesStrict instead of insertIssues to prevent FK constraint errors
+	// from silent INSERT OR IGNORE failures under concurrent load.
+	if err := insertIssuesStrict(ctx, t.conn, issues); err != nil {
 		return fmt.Errorf("failed to insert issues: %w", err)
 	}
 
@@ -310,11 +338,13 @@ func (t *sqliteTxStorage) GetIssue(ctx context.Context, id string) (*types.Issue
 	row := t.conn.QueryRowContext(ctx, `
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, updated_at, closed_at, external_ref,
+		       created_at, created_by, owner, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
 		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template,
-		       await_type, await_id, timeout_ns, waiters
+		       sender, ephemeral, pinned, is_template, crystallizes,
+		       await_type, await_id, timeout_ns, waiters,
+		       hook_bead, role_bead, agent_state, last_activity, role_type, rig, mol_type,
+		       due_at, defer_until, metadata
 		FROM issues
 		WHERE id = ?
 	`, id)
@@ -370,10 +400,15 @@ func (t *sqliteTxStorage) UpdateIssue(ctx context.Context, id string, updates ma
 		return fmt.Errorf("issue %s not found", id)
 	}
 
-	// Fetch custom statuses for validation
+	// Fetch custom statuses and types for validation
 	customStatuses, err := t.GetCustomStatuses(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get custom statuses: %w", err)
+	}
+
+	customTypes, err := t.GetCustomTypes(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get custom types: %w", err)
 	}
 
 	// Build update query with validated field names
@@ -386,8 +421,8 @@ func (t *sqliteTxStorage) UpdateIssue(ctx context.Context, id string, updates ma
 			return fmt.Errorf("invalid field for update: %s", key)
 		}
 
-		// Validate field values (with custom status support)
-		if err := validateFieldUpdateWithCustomStatuses(key, value, customStatuses); err != nil {
+		// Validate field values (with custom status and type support)
+		if err := validateFieldUpdateWithCustom(key, value, customStatuses, customTypes); err != nil {
 			return fmt.Errorf("failed to validate field update: %w", err)
 		}
 
@@ -564,15 +599,16 @@ func (t *sqliteTxStorage) CloseIssue(ctx context.Context, id string, reason stri
 
 	// Reactive convoy completion: check if any convoys tracking this issue should auto-close
 	// Find convoys that track this issue (convoy.issue_id tracks closed_issue.depends_on_id)
+	// Uses gt:convoy label instead of issue_type for Gas Town separation
 	convoyRows, err := t.conn.QueryContext(ctx, `
 		SELECT DISTINCT d.issue_id
 		FROM dependencies d
 		JOIN issues i ON d.issue_id = i.id
+		JOIN labels l ON i.id = l.issue_id AND l.label = 'gt:convoy'
 		WHERE d.depends_on_id = ?
 		  AND d.type = ?
-		  AND i.issue_type = ?
 		  AND i.status != ?
-	`, id, types.DepTracks, types.TypeConvoy, types.StatusClosed)
+	`, id, types.DepTracks, types.StatusClosed)
 	if err != nil {
 		return fmt.Errorf("failed to find tracking convoys: %w", err)
 	}
@@ -803,6 +839,37 @@ func (t *sqliteTxStorage) AddDependency(ctx context.Context, dep *types.Dependen
 	return nil
 }
 
+// GetDependencyRecords retrieves dependency records for an issue within the transaction.
+func (t *sqliteTxStorage) GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {
+	rows, err := t.conn.QueryContext(ctx, `
+		SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+		FROM dependencies
+		WHERE issue_id = ?
+	`, issueID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query dependencies: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var deps []*types.Dependency
+	for rows.Next() {
+		var d types.Dependency
+		var metadata sql.NullString
+		var threadID sql.NullString
+		if err := rows.Scan(&d.IssueID, &d.DependsOnID, &d.Type, &d.CreatedAt, &d.CreatedBy, &metadata, &threadID); err != nil {
+			return nil, fmt.Errorf("failed to scan dependency: %w", err)
+		}
+		if metadata.Valid {
+			d.Metadata = metadata.String
+		}
+		if threadID.Valid {
+			d.ThreadID = threadID.String
+		}
+		deps = append(deps, &d)
+	}
+	return deps, rows.Err()
+}
+
 // RemoveDependency removes a dependency within the transaction.
 func (t *sqliteTxStorage) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
 	// First, check what type of dependency is being removed
@@ -895,6 +962,11 @@ func (t *sqliteTxStorage) AddLabel(ctx context.Context, issueID, label, actor st
 	return nil
 }
 
+// GetLabels retrieves labels for an issue within the transaction.
+func (t *sqliteTxStorage) GetLabels(ctx context.Context, issueID string) ([]string, error) {
+	return t.getLabels(ctx, issueID)
+}
+
 // RemoveLabel removes a label from an issue within the transaction.
 func (t *sqliteTxStorage) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
 	result, err := t.conn.ExecContext(ctx, `
@@ -965,7 +1037,19 @@ func (t *sqliteTxStorage) GetCustomStatuses(ctx context.Context) ([]string, erro
 	if value == "" {
 		return nil, nil
 	}
-	return parseCustomStatuses(value), nil
+	return parseCommaSeparatedList(value), nil
+}
+
+// GetCustomTypes retrieves the list of custom issue types from config within the transaction.
+func (t *sqliteTxStorage) GetCustomTypes(ctx context.Context) ([]string, error) {
+	value, err := t.GetConfig(ctx, CustomTypeConfigKey)
+	if err != nil {
+		return nil, err
+	}
+	if value == "" {
+		return nil, nil
+	}
+	return parseCommaSeparatedList(value), nil
 }
 
 // SetMetadata sets a metadata value within the transaction.
@@ -1030,6 +1114,68 @@ func (t *sqliteTxStorage) AddComment(ctx context.Context, issueID, actor, commen
 	return nil
 }
 
+// ImportIssueComment adds a structured comment during import, preserving the original timestamp.
+func (t *sqliteTxStorage) ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error) {
+	// Verify issue exists
+	existing, err := t.GetIssue(ctx, issueID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check issue existence: %w", err)
+	}
+	if existing == nil {
+		return nil, fmt.Errorf("issue %s not found", issueID)
+	}
+
+	createdAtStr := createdAt.UTC().Format(time.RFC3339Nano)
+	res, err := t.conn.ExecContext(ctx, `
+		INSERT INTO comments (issue_id, author, text, created_at)
+		VALUES (?, ?, ?, ?)
+	`, issueID, author, text, createdAtStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert comment: %w", err)
+	}
+	commentID, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get comment ID: %w", err)
+	}
+
+	// Mark issue dirty
+	if err := markDirty(ctx, t.conn, issueID); err != nil {
+		return nil, fmt.Errorf("failed to mark issue dirty: %w", err)
+	}
+
+	return &types.Comment{
+		ID:        commentID,
+		IssueID:   issueID,
+		Author:    author,
+		Text:      text,
+		CreatedAt: createdAt.UTC(),
+	}, nil
+}
+
+// GetIssueComments retrieves structured comments for an issue within the transaction.
+func (t *sqliteTxStorage) GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error) {
+	rows, err := t.conn.QueryContext(ctx, `
+		SELECT id, issue_id, author, text, created_at
+		FROM comments
+		WHERE issue_id = ?
+		ORDER BY created_at ASC
+	`, issueID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query comments: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var comments []*types.Comment
+	for rows.Next() {
+		var c types.Comment
+		if err := rows.Scan(&c.ID, &c.IssueID, &c.Author, &c.Text, &c.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan comment: %w", err)
+		}
+		comments = append(comments, &c)
+	}
+	return comments, rows.Err()
+}
+
 // SearchIssues finds issues matching query and filters within the transaction.
 // This enables read-your-writes semantics for searching within a transaction.
 func (t *sqliteTxStorage) SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error) {
@@ -1079,6 +1225,16 @@ func (t *sqliteTxStorage) SearchIssues(ctx context.Context, query string, filter
 			args = append(args, string(s))
 		}
 		whereClauses = append(whereClauses, fmt.Sprintf("status NOT IN (%s)", strings.Join(placeholders, ",")))
+	}
+
+	// Type exclusion (for hiding internal types like gates, bd-7zka.2)
+	if len(filter.ExcludeTypes) > 0 {
+		placeholders := make([]string, len(filter.ExcludeTypes))
+		for i, t := range filter.ExcludeTypes {
+			placeholders[i] = "?"
+			args = append(args, string(t))
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("issue_type NOT IN (%s)", strings.Join(placeholders, ",")))
 	}
 
 	if filter.Priority != nil {
@@ -1171,6 +1327,12 @@ func (t *sqliteTxStorage) SearchIssues(ctx context.Context, query string, filter
 		whereClauses = append(whereClauses, fmt.Sprintf("id IN (%s)", strings.Join(placeholders, ", ")))
 	}
 
+	// ID prefix filtering (for shell completion)
+	if filter.IDPrefix != "" {
+		whereClauses = append(whereClauses, "id LIKE ?")
+		args = append(args, filter.IDPrefix+"%")
+	}
+
 	// Wisp filtering
 	if filter.Ephemeral != nil {
 		if *filter.Ephemeral {
@@ -1210,11 +1372,13 @@ func (t *sqliteTxStorage) SearchIssues(ctx context.Context, query string, filter
 	querySQL := fmt.Sprintf(`
 		SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
 		       status, priority, issue_type, assignee, estimated_minutes,
-		       created_at, created_by, updated_at, closed_at, external_ref,
+		       created_at, created_by, owner, updated_at, closed_at, external_ref,
 		       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
 		       deleted_at, deleted_by, delete_reason, original_type,
-		       sender, ephemeral, pinned, is_template,
-		       await_type, await_id, timeout_ns, waiters
+		       sender, ephemeral, pinned, is_template, crystallizes,
+		       await_type, await_id, timeout_ns, waiters,
+		       hook_bead, role_bead, agent_state, last_activity, role_type, rig, mol_type,
+		       due_at, defer_until, metadata
 		FROM issues
 		%s
 		ORDER BY priority ASC, created_at DESC
@@ -1240,10 +1404,13 @@ type scanner interface {
 // consistent scanning of issue rows.
 func scanIssueRow(row scanner) (*types.Issue, error) {
 	var issue types.Issue
+	var createdAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
+	var updatedAtStr sql.NullString // TEXT column - must parse manually for cross-driver compatibility
 	var contentHash sql.NullString
 	var closedAt sql.NullTime
 	var estimatedMinutes sql.NullInt64
 	var assignee sql.NullString
+	var owner sql.NullString
 	var externalRef sql.NullString
 	var compactedAt sql.NullTime
 	var originalSize sql.NullInt64
@@ -1261,24 +1428,49 @@ func scanIssueRow(row scanner) (*types.Issue, error) {
 	var pinned sql.NullInt64
 	// Template field
 	var isTemplate sql.NullInt64
+	// Crystallizes field (work economics)
+	var crystallizes sql.NullInt64
 	// Gate fields
 	var awaitType sql.NullString
 	var awaitID sql.NullString
 	var timeoutNs sql.NullInt64
 	var waiters sql.NullString
+	// Agent fields
+	var hookBead sql.NullString
+	var roleBead sql.NullString
+	var agentState sql.NullString
+	var lastActivity sql.NullTime
+	var roleType sql.NullString
+	var rig sql.NullString
+	var molType sql.NullString
+	// Time-based scheduling fields
+	var dueAt sql.NullTime
+	var deferUntil sql.NullTime
+	// Custom metadata field (GH#1406)
+	var metadata sql.NullString
 
 	err := row.Scan(
 		&issue.ID, &contentHash, &issue.Title, &issue.Description, &issue.Design,
 		&issue.AcceptanceCriteria, &issue.Notes, &issue.Status,
 		&issue.Priority, &issue.IssueType, &assignee, &estimatedMinutes,
-		&issue.CreatedAt, &issue.CreatedBy, &issue.UpdatedAt, &closedAt, &externalRef,
+		&createdAtStr, &issue.CreatedBy, &owner, &updatedAtStr, &closedAt, &externalRef,
 		&issue.CompactionLevel, &compactedAt, &compactedAtCommit, &originalSize, &sourceRepo, &closeReason,
 		&deletedAt, &deletedBy, &deleteReason, &originalType,
-		&sender, &wisp, &pinned, &isTemplate,
+		&sender, &wisp, &pinned, &isTemplate, &crystallizes,
 		&awaitType, &awaitID, &timeoutNs, &waiters,
+		&hookBead, &roleBead, &agentState, &lastActivity, &roleType, &rig, &molType,
+		&dueAt, &deferUntil, &metadata,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan issue: %w", err)
+	}
+
+	// Parse timestamp strings (TEXT columns require manual parsing)
+	if createdAtStr.Valid {
+		issue.CreatedAt = parseTimeString(createdAtStr.String)
+	}
+	if updatedAtStr.Valid {
+		issue.UpdatedAt = parseTimeString(updatedAtStr.String)
 	}
 
 	if contentHash.Valid {
@@ -1293,6 +1485,9 @@ func scanIssueRow(row scanner) (*types.Issue, error) {
 	}
 	if assignee.Valid {
 		issue.Assignee = assignee.String
+	}
+	if owner.Valid {
+		issue.Owner = owner.String
 	}
 	if externalRef.Valid {
 		issue.ExternalRef = &externalRef.String
@@ -1337,6 +1532,10 @@ func scanIssueRow(row scanner) (*types.Issue, error) {
 	if isTemplate.Valid && isTemplate.Int64 != 0 {
 		issue.IsTemplate = true
 	}
+	// Crystallizes field (work economics)
+	if crystallizes.Valid && crystallizes.Int64 != 0 {
+		issue.Crystallizes = true
+	}
 	// Gate fields
 	if awaitType.Valid {
 		issue.AwaitType = awaitType.String
@@ -1349,6 +1548,39 @@ func scanIssueRow(row scanner) (*types.Issue, error) {
 	}
 	if waiters.Valid && waiters.String != "" {
 		issue.Waiters = parseJSONStringArray(waiters.String)
+	}
+	// Agent fields
+	if hookBead.Valid {
+		issue.HookBead = hookBead.String
+	}
+	if roleBead.Valid {
+		issue.RoleBead = roleBead.String
+	}
+	if agentState.Valid {
+		issue.AgentState = types.AgentState(agentState.String)
+	}
+	if lastActivity.Valid {
+		issue.LastActivity = &lastActivity.Time
+	}
+	if roleType.Valid {
+		issue.RoleType = roleType.String
+	}
+	if rig.Valid {
+		issue.Rig = rig.String
+	}
+	if molType.Valid {
+		issue.MolType = types.MolType(molType.String)
+	}
+	// Time-based scheduling fields
+	if dueAt.Valid {
+		issue.DueAt = &dueAt.Time
+	}
+	if deferUntil.Valid {
+		issue.DeferUntil = &deferUntil.Time
+	}
+	// Custom metadata field (GH#1406)
+	if metadata.Valid && metadata.String != "" && metadata.String != "{}" {
+		issue.Metadata = []byte(metadata.String)
 	}
 
 	return &issue, nil

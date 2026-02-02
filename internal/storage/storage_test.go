@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -24,6 +25,9 @@ func (m *mockStorage) CreateIssue(ctx context.Context, issue *types.Issue, actor
 	return nil
 }
 func (m *mockStorage) CreateIssues(ctx context.Context, issues []*types.Issue, actor string) error {
+	return nil
+}
+func (m *mockStorage) CreateIssuesWithFullOptions(ctx context.Context, issues []*types.Issue, actor string, opts BatchCreateOptions) error {
 	return nil
 }
 func (m *mockStorage) GetIssue(ctx context.Context, id string) (*types.Issue, error) {
@@ -68,6 +72,9 @@ func (m *mockStorage) GetDependencyRecords(ctx context.Context, issueID string) 
 func (m *mockStorage) GetAllDependencyRecords(ctx context.Context) (map[string][]*types.Dependency, error) {
 	return nil, nil
 }
+func (m *mockStorage) GetDependencyRecordsForIssues(ctx context.Context, issueIDs []string) (map[string][]*types.Dependency, error) {
+	return nil, nil
+}
 func (m *mockStorage) GetDependencyCounts(ctx context.Context, issueIDs []string) (map[string]*types.DependencyCounts, error) {
 	return nil, nil
 }
@@ -98,6 +105,9 @@ func (m *mockStorage) GetReadyWork(ctx context.Context, filter types.WorkFilter)
 func (m *mockStorage) GetBlockedIssues(ctx context.Context, filter types.WorkFilter) ([]*types.BlockedIssue, error) {
 	return nil, nil
 }
+func (m *mockStorage) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
+	return false, nil, nil
+}
 func (m *mockStorage) GetEpicsEligibleForClosure(ctx context.Context) ([]*types.EpicStatus, error) {
 	return nil, nil
 }
@@ -113,13 +123,22 @@ func (m *mockStorage) AddComment(ctx context.Context, issueID, actor, comment st
 func (m *mockStorage) GetEvents(ctx context.Context, issueID string, limit int) ([]*types.Event, error) {
 	return nil, nil
 }
+func (m *mockStorage) GetAllEventsSince(ctx context.Context, sinceID int64) ([]*types.Event, error) {
+	return nil, nil
+}
 func (m *mockStorage) AddIssueComment(ctx context.Context, issueID, author, text string) (*types.Comment, error) {
+	return nil, nil
+}
+func (m *mockStorage) ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error) {
 	return nil, nil
 }
 func (m *mockStorage) GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error) {
 	return nil, nil
 }
 func (m *mockStorage) GetCommentsForIssues(ctx context.Context, issueIDs []string) (map[string][]*types.Comment, error) {
+	return nil, nil
+}
+func (m *mockStorage) GetCommentCounts(ctx context.Context, issueIDs []string) (map[string]int, error) {
 	return nil, nil
 }
 func (m *mockStorage) GetStatistics(ctx context.Context) (*types.Statistics, error) {
@@ -168,6 +187,9 @@ func (m *mockStorage) DeleteConfig(ctx context.Context, key string) error {
 	return nil
 }
 func (m *mockStorage) GetCustomStatuses(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+func (m *mockStorage) GetCustomTypes(ctx context.Context) ([]string, error) {
 	return nil, nil
 }
 func (m *mockStorage) SetMetadata(ctx context.Context, key, value string) error {
@@ -231,11 +253,17 @@ func (m *mockTransaction) AddDependency(ctx context.Context, dep *types.Dependen
 func (m *mockTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
 	return nil
 }
+func (m *mockTransaction) GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {
+	return nil, nil
+}
 func (m *mockTransaction) AddLabel(ctx context.Context, issueID, label, actor string) error {
 	return nil
 }
 func (m *mockTransaction) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
 	return nil
+}
+func (m *mockTransaction) GetLabels(ctx context.Context, issueID string) ([]string, error) {
+	return nil, nil
 }
 func (m *mockTransaction) SetConfig(ctx context.Context, key, value string) error {
 	return nil
@@ -251,6 +279,12 @@ func (m *mockTransaction) GetMetadata(ctx context.Context, key string) (string, 
 }
 func (m *mockTransaction) AddComment(ctx context.Context, issueID, actor, comment string) error {
 	return nil
+}
+func (m *mockTransaction) ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error) {
+	return nil, nil
+}
+func (m *mockTransaction) GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error) {
+	return nil, nil
 }
 
 // TestConfig verifies the Config struct has expected fields.
@@ -296,6 +330,7 @@ func TestInterfaceDocumentation(t *testing.T) {
 		// Verify issue operations
 		_ = s.CreateIssue
 		_ = s.CreateIssues
+		_ = s.CreateIssuesWithFullOptions
 		_ = s.GetIssue
 		_ = s.GetIssueByExternalRef
 		_ = s.UpdateIssue
@@ -330,6 +365,7 @@ func TestInterfaceDocumentation(t *testing.T) {
 		// Verify event/comment operations
 		_ = s.AddComment
 		_ = s.GetEvents
+		_ = s.GetAllEventsSince
 		_ = s.AddIssueComment
 		_ = s.GetIssueComments
 		_ = s.GetCommentsForIssues
@@ -358,6 +394,7 @@ func TestInterfaceDocumentation(t *testing.T) {
 		_ = s.GetAllConfig
 		_ = s.DeleteConfig
 		_ = s.GetCustomStatuses
+		_ = s.GetCustomTypes
 
 		// Verify metadata operations
 		_ = s.SetMetadata

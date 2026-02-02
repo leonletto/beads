@@ -9,7 +9,7 @@ Beads has several components - here's what they are and when you need them:
 | Component | What It Is | When You Need It |
 |-----------|------------|------------------|
 | **bd CLI** | Core command-line tool | Always - this is the foundation |
-| **Claude Code Plugin** | Slash commands + enhanced UX | Optional - if you want `/bd-ready`, `/bd-create` commands |
+| **Claude Code Plugin** | Slash commands + enhanced UX | Optional - if you want `/beads:ready`, `/beads:create` commands |
 | **MCP Server (beads-mcp)** | Model Context Protocol interface | Only for MCP-only environments (Claude Desktop, Amp) |
 
 **How they relate:**
@@ -17,11 +17,14 @@ Beads has several components - here's what they are and when you need them:
 - The **Plugin** enhances Claude Code with slash commands but *requires* the CLI installed
 - The **MCP server** is an *alternative* to the CLI for environments without shell access
 
+**Important:** Beads is installed system-wide, not cloned into your project. The `.beads/` directory in your project only contains the issue database.
+
 **Typical setups:**
 
 | Environment | What to Install |
 |-------------|-----------------|
 | Claude Code, Cursor, Windsurf | bd CLI (+ optional Plugin for Claude Code) |
+| GitHub Copilot (VS Code) | bd CLI + MCP server |
 | Claude Desktop (no shell) | MCP server only |
 | Terminal / scripts | bd CLI only |
 | CI/CD pipelines | bd CLI only |
@@ -33,8 +36,7 @@ Beads has several components - here's what they are and when you need them:
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Why Homebrew?**
@@ -50,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/insta
 ```
 
 The installer will:
-- Detect your platform (macOS/Linux, amd64/arm64)
+- Detect your platform (macOS/Linux/FreeBSD, amd64/arm64)
 - Install via `go install` if Go is available
 - Fall back to building from source if needed
 - Guide you through PATH setup if necessary
@@ -61,6 +63,7 @@ The installer will:
 |--------|----------|---------|---------------|-------|
 | **Homebrew** | macOS/Linux users | `brew upgrade bd` | Homebrew | Recommended. Handles everything automatically |
 | **npm** | JS/Node.js projects | `npm update -g @beads/bd` | Node.js | Convenient if npm is your ecosystem |
+| **bun** | JS/Bun.js projects | `bun install -g --trust @beads/bd` | Bun.js | Convenient if bun is your ecosystem |
 | **Install script** | Quick setup, CI/CD | Re-run script | curl, bash | Good for automation and one-liners |
 | **go install** | Go developers | Re-run command | Go 1.24+ | Builds from source, always latest |
 | **From source** | Contributors, custom builds | `git pull && go build` | Go, git | Full control, can modify code |
@@ -74,8 +77,7 @@ The installer will:
 
 **Via Homebrew** (recommended):
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Via go install**:
@@ -95,8 +97,7 @@ sudo mv bd /usr/local/bin/
 
 **Via Homebrew** (works on Linux too):
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Arch Linux** (AUR):
@@ -120,6 +121,18 @@ git clone https://github.com/steveyegge/beads
 cd beads
 go build -o bd ./cmd/bd
 sudo mv bd /usr/local/bin/
+```
+
+### FreeBSD
+
+**Via Quick Install Script**:
+```bash
+curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+```
+
+**Via go install**:
+```bash
+go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### Windows 11
@@ -166,7 +179,7 @@ bd version
 
 ```bash
 # 1. Install bd CLI (see Quick Install above)
-brew install bd
+brew install beads
 
 # 2. Initialize in your project
 cd your-project
@@ -176,6 +189,7 @@ bd init --quiet
 bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
+bd setup codex    # Codex CLI - creates/updates AGENTS.md
 ```
 
 **How it works:**
@@ -195,6 +209,7 @@ bd setup aider    # Aider - creates .aider.conf.yml
 bd setup claude --check   # Check Claude Code integration
 bd setup cursor --check   # Check Cursor integration
 bd setup aider --check    # Check Aider integration
+bd setup codex --check    # Check Codex integration
 ```
 
 ### Claude Code Plugin (Optional)
@@ -209,10 +224,58 @@ For enhanced UX with slash commands:
 ```
 
 The plugin adds:
-- Slash commands: `/bd-ready`, `/bd-create`, `/bd-show`, `/bd-update`, `/bd-close`, etc.
+- Slash commands: `/beads:ready`, `/beads:create`, `/beads:show`, `/beads:update`, `/beads:close`, etc.
 - Task agent for autonomous execution
 
 See [PLUGIN.md](PLUGIN.md) for complete plugin documentation.
+
+### GitHub Copilot (VS Code)
+
+For VS Code with GitHub Copilot:
+
+1. **Install beads-mcp:**
+   ```bash
+   uv tool install beads-mcp
+   ```
+
+2. **Configure MCP** - Create `.vscode/mcp.json` in your project:
+   ```json
+   {
+     "servers": {
+       "beads": {
+         "command": "beads-mcp"
+       }
+     }
+   }
+   ```
+
+   **For all projects:** Add to VS Code user-level MCP config:
+
+   | Platform | Path |
+   |----------|------|
+   | macOS | `~/Library/Application Support/Code/User/mcp.json` |
+   | Linux | `~/.config/Code/User/mcp.json` |
+   | Windows | `%APPDATA%\Code\User\mcp.json` |
+
+   ```json
+   {
+     "servers": {
+       "beads": {
+         "command": "beads-mcp",
+         "args": []
+       }
+     }
+   }
+   ```
+
+3. **Initialize project:**
+   ```bash
+   bd init --quiet
+   ```
+
+4. **Reload VS Code**
+
+See [COPILOT_INTEGRATION.md](COPILOT_INTEGRATION.md) for complete setup guide.
 
 ### MCP Server (Alternative - for MCP-only environments)
 

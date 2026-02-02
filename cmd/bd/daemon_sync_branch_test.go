@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/types"
@@ -1542,4 +1544,1500 @@ func TestGitPushFromWorktree_FetchRebaseRetry(t *testing.T) {
 	}
 
 	t.Log("Fetch-rebase-retry test passed: diverged sync branch was successfully rebased and pushed")
+}
+
+// TestDaemonSyncBranchE2E tests the daemon sync-branch flow with concurrent changes from
+// two machines using a real bare repo. This tests the daemon path (syncBranchCommitAndPush/Pull)
+// as opposed to TestSyncBranchE2E which tests the CLI path (syncbranch.CommitToSyncBranch/Pull).
+//
+// Key difference from CLI path tests:
+// - CLI: Uses syncbranch.CommitToSyncBranch() from internal/syncbranch
+// - Daemon: Uses syncBranchCommitAndPush() from daemon_sync_branch.go
+//
+// Flow:
+// 1. Machine A creates bd-1, calls daemon syncBranchCommitAndPush(), pushes to bare remote
+// 2. Machine B creates bd-2, calls daemon syncBranchCommitAndPush(), pushes to bare remote
+// 3. Machine A calls daemon syncBranchPull(), should merge both issues
+// 4. Verify both issues present after merge
+func TestDaemonSyncBranchE2E(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Skip on Windows due to path issues with worktrees
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping on Windows")
+	}
+
+	ctx := context.Background()
+
+	// Setup: Create bare remote with two clones using Phase 1 helper
+	_, machineA, machineB, cleanup := setupBareRemoteWithClones(t)
+	defer cleanup()
+
+	// Use unique sync branch name and set via env var (highest priority)
+	// This overrides any config.yaml setting
+	syncBranch := "beads-daemon-sync"
+	t.Setenv(syncbranch.EnvVar, syncBranch)
+
+	// Machine A: Setup database with sync.branch configured
+	var storeA *sqlite.SQLiteStorage
+	var jsonlPathA string
+
+	withBeadsDir(t, machineA, func() {
+		beadsDirA := filepath.Join(machineA, ".beads")
+		dbPathA := filepath.Join(beadsDirA, "beads.db")
+
+		var err error
+		storeA, err = sqlite.New(ctx, dbPathA)
+		if err != nil {
+			t.Fatalf("Failed to create store for Machine A: %v", err)
+		}
+
+		// Configure store
+		if err := storeA.SetConfig(ctx, "issue_prefix", "bd"); err != nil {
+			t.Fatalf("Failed to set issue_prefix: %v", err)
+		}
+		if err := storeA.SetConfig(ctx, syncbranch.ConfigKey, syncBranch); err != nil {
+			t.Fatalf("Failed to set sync.branch: %v", err)
+		}
+
+		// Create issue in Machine A
+		issueA := &types.Issue{
+			Title:     "Issue from Machine A (daemon path)",
+			Status:    types.StatusOpen,
+			Priority:  1,
+			IssueType: types.TypeTask,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		if err := storeA.CreateIssue(ctx, issueA, "machineA"); err != nil {
+			t.Fatalf("Failed to create issue in Machine A: %v", err)
+		}
+		t.Logf("Machine A created issue: %s", issueA.ID)
+
+		// Export to JSONL
+		jsonlPathA = filepath.Join(beadsDirA, "issues.jsonl")
+		if err := exportToJSONLWithStore(ctx, storeA, jsonlPathA); err != nil {
+			t.Fatalf("Failed to export JSONL for Machine A: %v", err)
+		}
+
+		// Change to machineA directory for git operations
+		if err := os.Chdir(machineA); err != nil {
+			t.Fatalf("Failed to chdir to machineA: %v", err)
+		}
+
+		// Set global dbPath so findJSONLPath() works for daemon functions
+		oldDBPath := dbPath
+		dbPath = dbPathA
+		defer func() { dbPath = oldDBPath }()
+
+		// Machine A: Commit and push using daemon path (syncBranchCommitAndPush)
+		log, _ := newTestSyncBranchLogger()
+		committed, err := syncBranchCommitAndPush(ctx, storeA, true, log)
+		if err != nil {
+			t.Fatalf("Machine A syncBranchCommitAndPush failed: %v", err)
+		}
+		if !committed {
+			t.Fatal("Expected Machine A daemon commit to succeed")
+		}
+		t.Log("Machine A: Daemon committed and pushed issue to sync branch")
+	})
+	defer storeA.Close()
+
+	// Reset git caches before switching to Machine B to prevent path caching issues
+	git.ResetCaches()
+
+	// Machine B: Setup database and sync with Machine A's changes first
+	var storeB *sqlite.SQLiteStorage
+	var jsonlPathB string
+
+	withBeadsDir(t, machineB, func() {
+		beadsDirB := filepath.Join(machineB, ".beads")
+		dbPathB := filepath.Join(beadsDirB, "beads.db")
+
+		var err error
+		storeB, err = sqlite.New(ctx, dbPathB)
+		if err != nil {
+			t.Fatalf("Failed to create store for Machine B: %v", err)
+		}
+
+		// Configure store
+		if err := storeB.SetConfig(ctx, "issue_prefix", "bd"); err != nil {
+			t.Fatalf("Failed to set issue_prefix: %v", err)
+		}
+		if err := storeB.SetConfig(ctx, syncbranch.ConfigKey, syncBranch); err != nil {
+			t.Fatalf("Failed to set sync.branch: %v", err)
+		}
+
+		jsonlPathB = filepath.Join(beadsDirB, "issues.jsonl")
+
+		// Change to machineB directory for git operations
+		if err := os.Chdir(machineB); err != nil {
+			t.Fatalf("Failed to chdir to machineB: %v", err)
+		}
+
+		// Set global dbPath so findJSONLPath() works for daemon functions
+		oldDBPath := dbPath
+		dbPath = dbPathB
+		defer func() { dbPath = oldDBPath }()
+
+		// Machine B: First pull from sync branch to get Machine A's issue
+		// This is the correct workflow - always pull before creating local changes
+		log, _ := newTestSyncBranchLogger()
+		pulled, err := syncBranchPull(ctx, storeB, log)
+		if err != nil {
+			t.Logf("Machine B initial pull error (may be expected): %v", err)
+		}
+		if pulled {
+			t.Log("Machine B: Pulled Machine A's changes from sync branch")
+		}
+
+		// Import the pulled JSONL into Machine B's database
+		if _, err := os.Stat(jsonlPathB); err == nil {
+			if err := importToJSONLWithStore(ctx, storeB, jsonlPathB); err != nil {
+				t.Logf("Machine B import warning: %v", err)
+			}
+		}
+
+		// Create issue in Machine B (different from A)
+		issueB := &types.Issue{
+			Title:     "Issue from Machine B (daemon path)",
+			Status:    types.StatusOpen,
+			Priority:  2,
+			IssueType: types.TypeBug,
+			CreatedAt: time.Now().Add(time.Second), // Ensure different timestamp
+			UpdatedAt: time.Now().Add(time.Second),
+		}
+		if err := storeB.CreateIssue(ctx, issueB, "machineB"); err != nil {
+			t.Fatalf("Failed to create issue in Machine B: %v", err)
+		}
+		t.Logf("Machine B created issue: %s", issueB.ID)
+
+		// Export to JSONL (now includes both Machine A's and Machine B's issues)
+		if err := exportToJSONLWithStore(ctx, storeB, jsonlPathB); err != nil {
+			t.Fatalf("Failed to export JSONL for Machine B: %v", err)
+		}
+
+		// Machine B: Commit and push using daemon path
+		// This should succeed without conflict because we pulled first
+		committed, err := syncBranchCommitAndPush(ctx, storeB, true, log)
+		if err != nil {
+			t.Fatalf("Machine B syncBranchCommitAndPush failed: %v", err)
+		}
+		if !committed {
+			t.Fatal("Expected Machine B daemon commit to succeed")
+		}
+		t.Log("Machine B: Daemon committed and pushed issue to sync branch")
+	})
+	defer storeB.Close()
+
+	// Reset git caches before switching back to Machine A
+	git.ResetCaches()
+
+	// Machine A: Pull from sync branch using daemon path
+	withBeadsDir(t, machineA, func() {
+		beadsDirA := filepath.Join(machineA, ".beads")
+		dbPathA := filepath.Join(beadsDirA, "beads.db")
+
+		// Change to machineA directory for git operations
+		if err := os.Chdir(machineA); err != nil {
+			t.Fatalf("Failed to chdir to machineA: %v", err)
+		}
+
+		// Set global dbPath so findJSONLPath() works for daemon functions
+		oldDBPath := dbPath
+		dbPath = dbPathA
+		defer func() { dbPath = oldDBPath }()
+
+		log, _ := newTestSyncBranchLogger()
+		pulled, err := syncBranchPull(ctx, storeA, log)
+		if err != nil {
+			t.Fatalf("Machine A syncBranchPull failed: %v", err)
+		}
+		if !pulled {
+			t.Log("Machine A syncBranchPull returned false (may be expected if no remote changes)")
+		} else {
+			t.Log("Machine A: Daemon pulled from sync branch")
+		}
+	})
+
+	// Verify: Both issues should be present in Machine A's JSONL after merge
+	content, err := os.ReadFile(jsonlPathA)
+	if err != nil {
+		t.Fatalf("Failed to read Machine A's JSONL: %v", err)
+	}
+
+	contentStr := string(content)
+	hasMachineA := strings.Contains(contentStr, "Machine A")
+	hasMachineB := strings.Contains(contentStr, "Machine B")
+
+	if hasMachineA {
+		t.Log("Issue from Machine A preserved in JSONL")
+	} else {
+		t.Error("FAIL: Issue from Machine A missing after merge")
+	}
+
+	if hasMachineB {
+		t.Log("Issue from Machine B merged into JSONL")
+	} else {
+		t.Error("FAIL: Issue from Machine B missing after merge")
+	}
+
+	if hasMachineA && hasMachineB {
+		t.Log("Daemon sync-branch E2E test PASSED: both issues present after merge")
+	}
+
+	// Clean up git caches to prevent test pollution
+	git.ResetCaches()
+}
+
+// TestDaemonSyncBranchForceOverwrite tests the forceOverwrite flag behavior for delete mutations.
+// When forceOverwrite is true, the local JSONL is copied directly to the worktree without merging,
+// which is necessary for delete mutations to be properly reflected in the sync branch.
+//
+// Flow:
+// 1. Machine A creates issue, commits to sync branch
+// 2. Machine A deletes issue locally, calls syncBranchCommitAndPushWithOptions(forceOverwrite=true)
+// 3. Verify the deletion is reflected in the sync branch worktree
+func TestDaemonSyncBranchForceOverwrite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Skip on Windows due to path issues with worktrees
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping on Windows")
+	}
+
+	ctx := context.Background()
+
+	// Setup: Create bare remote with two clones
+	_, machineA, _, cleanup := setupBareRemoteWithClones(t)
+	defer cleanup()
+
+	// Use unique sync branch name and set via env var (highest priority)
+	// This overrides any config.yaml setting
+	syncBranch := "beads-force-sync"
+	t.Setenv(syncbranch.EnvVar, syncBranch)
+
+	withBeadsDir(t, machineA, func() {
+		beadsDirA := filepath.Join(machineA, ".beads")
+		dbPathA := filepath.Join(beadsDirA, "beads.db")
+
+		storeA, err := sqlite.New(ctx, dbPathA)
+		if err != nil {
+			t.Fatalf("Failed to create store: %v", err)
+		}
+		defer storeA.Close()
+
+		// Configure store
+		if err := storeA.SetConfig(ctx, "issue_prefix", "bd"); err != nil {
+			t.Fatalf("Failed to set issue_prefix: %v", err)
+		}
+		if err := storeA.SetConfig(ctx, syncbranch.ConfigKey, syncBranch); err != nil {
+			t.Fatalf("Failed to set sync.branch: %v", err)
+		}
+
+		// Create two issues
+		issue1 := &types.Issue{
+			Title:     "Issue to keep",
+			Status:    types.StatusOpen,
+			Priority:  1,
+			IssueType: types.TypeTask,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		if err := storeA.CreateIssue(ctx, issue1, "test"); err != nil {
+			t.Fatalf("Failed to create issue1: %v", err)
+		}
+
+		issue2 := &types.Issue{
+			Title:     "Issue to delete",
+			Status:    types.StatusOpen,
+			Priority:  2,
+			IssueType: types.TypeTask,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		if err := storeA.CreateIssue(ctx, issue2, "test"); err != nil {
+			t.Fatalf("Failed to create issue2: %v", err)
+		}
+		issue2ID := issue2.ID
+		t.Logf("Created issue to delete: %s", issue2ID)
+
+		// Export to JSONL
+		jsonlPath := filepath.Join(beadsDirA, "issues.jsonl")
+		if err := exportToJSONLWithStore(ctx, storeA, jsonlPath); err != nil {
+			t.Fatalf("Failed to export JSONL: %v", err)
+		}
+
+		// Change to machineA directory for git operations
+		if err := os.Chdir(machineA); err != nil {
+			t.Fatalf("Failed to chdir: %v", err)
+		}
+
+		// Set global dbPath so findJSONLPath() works for daemon functions
+		oldDBPath := dbPath
+		dbPath = dbPathA
+		defer func() { dbPath = oldDBPath }()
+
+		// First commit with both issues (without forceOverwrite)
+		log, _ := newTestSyncBranchLogger()
+		committed, err := syncBranchCommitAndPush(ctx, storeA, true, log)
+		if err != nil {
+			t.Fatalf("Initial commit failed: %v", err)
+		}
+		if !committed {
+			t.Fatal("Expected initial commit to succeed")
+		}
+		t.Log("Initial commit with both issues succeeded")
+
+		// Verify worktree has both issues
+		worktreePath := filepath.Join(machineA, ".git", "beads-worktrees", syncBranch)
+		worktreeJSONL := filepath.Join(worktreePath, ".beads", "issues.jsonl")
+		initialContent, err := os.ReadFile(worktreeJSONL)
+		if err != nil {
+			t.Fatalf("Failed to read worktree JSONL: %v", err)
+		}
+		if !strings.Contains(string(initialContent), "Issue to delete") {
+			t.Error("Initial worktree JSONL should contain 'Issue to delete'")
+		}
+
+		// Now delete the issue from database
+		if err := storeA.DeleteIssue(ctx, issue2ID); err != nil {
+			t.Fatalf("Failed to delete issue: %v", err)
+		}
+		t.Logf("Deleted issue %s from database", issue2ID)
+
+		// Export JSONL after deletion (issue2 should not be in the file)
+		if err := exportToJSONLWithStore(ctx, storeA, jsonlPath); err != nil {
+			t.Fatalf("Failed to export JSONL after deletion: %v", err)
+		}
+
+		// Verify local JSONL no longer has the deleted issue
+		localContent, err := os.ReadFile(jsonlPath)
+		if err != nil {
+			t.Fatalf("Failed to read local JSONL: %v", err)
+		}
+		if strings.Contains(string(localContent), "Issue to delete") {
+			t.Error("Local JSONL should not contain deleted issue")
+		}
+
+		// Commit with forceOverwrite=true (simulating delete mutation)
+		committed, err = syncBranchCommitAndPushWithOptions(ctx, storeA, true, true, log)
+		if err != nil {
+			t.Fatalf("forceOverwrite commit failed: %v", err)
+		}
+		if !committed {
+			t.Fatal("Expected forceOverwrite commit to succeed")
+		}
+		t.Log("forceOverwrite commit succeeded")
+
+		// Verify worktree JSONL no longer has the deleted issue
+		afterContent, err := os.ReadFile(worktreeJSONL)
+		if err != nil {
+			t.Fatalf("Failed to read worktree JSONL after forceOverwrite: %v", err)
+		}
+
+		if strings.Contains(string(afterContent), "Issue to delete") {
+			t.Error("FAIL: Worktree JSONL still contains deleted issue after forceOverwrite")
+		} else {
+			t.Log("Worktree JSONL correctly reflects deletion after forceOverwrite")
+		}
+
+		if !strings.Contains(string(afterContent), "Issue to keep") {
+			t.Error("FAIL: Worktree JSONL should still contain 'Issue to keep'")
+		} else {
+			t.Log("Worktree JSONL correctly preserves non-deleted issue")
+		}
+
+		t.Log("forceOverwrite test PASSED: delete mutation correctly propagated")
+	})
+
+	// Clean up git caches to prevent test pollution
+	git.ResetCaches()
+}
+
+// TestDaemonExportSkipsSameBranch tests that daemon export is skipped when
+// sync-branch == current-branch. This prevents the worktree conflict issue (GH#1258).
+func TestDaemonExportSkipsSameBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up git caches to avoid pollution from previous tests
+	git.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Change to temp directory first (so git commands work)
+	t.Chdir(tmpDir)
+
+	// Get current branch name
+	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd.Dir = tmpDir
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get current branch: %v", err)
+	}
+	currentBranch := strings.TrimSpace(string(output))
+
+	// Set BEADS_SYNC_BRANCH to the current branch (highest priority config)
+	// This is the bug case: sync-branch == current-branch
+	t.Setenv(syncbranch.EnvVar, currentBranch)
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	dbPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create test issue
+	issue := &types.Issue{
+		Title:     "Test same branch guard",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("Failed to create issue: %v", err)
+	}
+
+	// Export to JSONL (initial export for setup)
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := exportToJSONLWithStore(ctx, store, jsonlPath); err != nil {
+		t.Fatalf("Failed to export: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call performExport (via createExportFunc) - this should be skipped
+	exportFn := createExportFunc(ctx, store, true, false, log)
+	exportFn()
+
+	// Verify the operation was skipped by checking log output
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Skipping") || !strings.Contains(logOutput, "sync-branch") {
+		t.Errorf("Expected log to contain skip message about sync-branch, got:\n%s", logOutput)
+	}
+
+	// Verify the log mentions the current branch
+	if !strings.Contains(logOutput, currentBranch) {
+		t.Errorf("Expected log to mention branch '%s', got:\n%s", currentBranch, logOutput)
+	}
+
+	// Verify "Starting export" was NOT logged (guard returned early)
+	if strings.Contains(logOutput, "Starting export") {
+		t.Error("Expected export to be skipped before 'Starting export' was logged")
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestDaemonAutoImportSkipsSameBranch tests that daemon auto-import is skipped when
+// sync-branch == current-branch. This prevents the worktree conflict issue (GH#1258).
+func TestDaemonAutoImportSkipsSameBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up caches to avoid pollution from previous tests
+	git.ResetCaches()
+	beads.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Change to temp directory first (so git commands work)
+	t.Chdir(tmpDir)
+
+	// Get current branch name
+	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd.Dir = tmpDir
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get current branch: %v", err)
+	}
+	currentBranch := strings.TrimSpace(string(output))
+
+	// Set BEADS_SYNC_BRANCH to the current branch (highest priority config)
+	// This is the bug case: sync-branch == current-branch
+	t.Setenv(syncbranch.EnvVar, currentBranch)
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	dbPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create JSONL file (needed for auto-import)
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(`{"id":"test-1","title":"Test issue"}`+"\n"), 0644); err != nil {
+		t.Fatalf("Failed to write JSONL: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call performAutoImport (via createAutoImportFunc) - this should be skipped
+	importFn := createAutoImportFunc(ctx, store, log)
+	importFn()
+
+	// Verify the operation was skipped by checking log output
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Skipping") || !strings.Contains(logOutput, "sync-branch") {
+		t.Errorf("Expected log to contain skip message about sync-branch, got:\n%s", logOutput)
+	}
+
+	// Verify the log mentions the current branch
+	if !strings.Contains(logOutput, currentBranch) {
+		t.Errorf("Expected log to mention branch '%s', got:\n%s", currentBranch, logOutput)
+	}
+
+	// Verify "Starting auto-import" was NOT logged (guard returned early)
+	if strings.Contains(logOutput, "Starting auto-import") {
+		t.Error("Expected auto-import to be skipped before 'Starting auto-import' was logged")
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestDaemonSyncSkipsSameBranch tests that daemon sync cycle is skipped when
+// sync-branch == current-branch. This prevents the worktree conflict issue (GH#1258).
+func TestDaemonSyncSkipsSameBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up caches to avoid pollution from previous tests
+	git.ResetCaches()
+	beads.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Change to temp directory first (so git commands work)
+	t.Chdir(tmpDir)
+
+	// Get current branch name
+	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd.Dir = tmpDir
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get current branch: %v", err)
+	}
+	currentBranch := strings.TrimSpace(string(output))
+
+	// Set BEADS_SYNC_BRANCH to the current branch (highest priority config)
+	// This is the bug case: sync-branch == current-branch
+	t.Setenv(syncbranch.EnvVar, currentBranch)
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	dbPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create test issue
+	issue := &types.Issue{
+		Title:     "Test same branch guard",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("Failed to create issue: %v", err)
+	}
+
+	// Export to JSONL (initial export for setup)
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := exportToJSONLWithStore(ctx, store, jsonlPath); err != nil {
+		t.Fatalf("Failed to export: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call performSync (via createSyncFunc) - this should be skipped
+	syncFn := createSyncFunc(ctx, store, true, false, log)
+	syncFn()
+
+	// Verify the operation was skipped by checking log output
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Skipping") || !strings.Contains(logOutput, "sync-branch") {
+		t.Errorf("Expected log to contain skip message about sync-branch, got:\n%s", logOutput)
+	}
+
+	// Verify the log mentions the current branch
+	if !strings.Contains(logOutput, currentBranch) {
+		t.Errorf("Expected log to mention branch '%s', got:\n%s", currentBranch, logOutput)
+	}
+
+	// Verify "Starting sync cycle" was NOT logged (guard returned early)
+	if strings.Contains(logOutput, "Starting sync cycle") {
+		t.Error("Expected sync cycle to be skipped before 'Starting sync cycle' was logged")
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestSyncBranchCommitSkipsSameBranch tests that syncBranchCommitAndPushWithOptions
+// is skipped when sync-branch == current-branch. This prevents the worktree conflict issue (GH#1258).
+func TestSyncBranchCommitSkipsSameBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up caches to avoid pollution from previous tests
+	git.ResetCaches()
+	beads.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Change to temp directory first (so git commands work)
+	t.Chdir(tmpDir)
+
+	// Add a dummy remote so hasGitRemote() returns true
+	runGitCmd(t, tmpDir, "remote", "add", "origin", "https://example.com/dummy.git")
+
+	// Get current branch name
+	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd.Dir = tmpDir
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get current branch: %v", err)
+	}
+	currentBranch := strings.TrimSpace(string(output))
+
+	// Set BEADS_SYNC_BRANCH to the current branch (highest priority config)
+	// This is the bug case: sync-branch == current-branch
+	t.Setenv(syncbranch.EnvVar, currentBranch)
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Set global dbPath so findJSONLPath() works
+	oldDBPath := dbPath
+	defer func() { dbPath = oldDBPath }()
+	dbPath = testDBPath
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create test issue and export to JSONL
+	issue := &types.Issue{
+		Title:     "Test same branch guard",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("Failed to create issue: %v", err)
+	}
+
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := exportToJSONLWithStore(ctx, store, jsonlPath); err != nil {
+		t.Fatalf("Failed to export: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call syncBranchCommitAndPushWithOptions - this should be skipped
+	committed, err := syncBranchCommitAndPushWithOptions(ctx, store, false, false, log)
+
+	// Should return false (not committed), no error
+	if err != nil {
+		t.Errorf("Expected no error when same branch detected, got: %v", err)
+	}
+	if committed {
+		t.Error("Expected committed=false when same branch detected")
+	}
+
+	// Verify the operation was skipped by checking log output
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Skipping") || !strings.Contains(logOutput, "sync-branch") {
+		t.Errorf("Expected log to contain skip message about sync-branch, got:\n%s", logOutput)
+	}
+
+	// Verify the log mentions the current branch
+	if !strings.Contains(logOutput, currentBranch) {
+		t.Errorf("Expected log to mention branch '%s', got:\n%s", currentBranch, logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestSyncBranchPullSkipsSameBranch tests that syncBranchPull is skipped when
+// sync-branch == current-branch. This prevents the worktree conflict issue (GH#1258).
+func TestSyncBranchPullSkipsSameBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up caches to avoid pollution from previous tests
+	git.ResetCaches()
+	beads.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Change to temp directory first (so git commands work)
+	t.Chdir(tmpDir)
+
+	// Add a dummy remote so hasGitRemote() returns true
+	runGitCmd(t, tmpDir, "remote", "add", "origin", "https://example.com/dummy.git")
+
+	// Get current branch name
+	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd.Dir = tmpDir
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get current branch: %v", err)
+	}
+	currentBranch := strings.TrimSpace(string(output))
+
+	// Set BEADS_SYNC_BRANCH to the current branch (highest priority config)
+	// This is the bug case: sync-branch == current-branch
+	t.Setenv(syncbranch.EnvVar, currentBranch)
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Set global dbPath so findJSONLPath() works
+	oldDBPath := dbPath
+	defer func() { dbPath = oldDBPath }()
+	dbPath = testDBPath
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call syncBranchPull - this should be skipped
+	pulled, err := syncBranchPull(ctx, store, log)
+
+	// Should return false (not pulled), no error
+	if err != nil {
+		t.Errorf("Expected no error when same branch detected, got: %v", err)
+	}
+	if pulled {
+		t.Error("Expected pulled=false when same branch detected")
+	}
+
+	// Verify the operation was skipped by checking log output
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Skipping") || !strings.Contains(logOutput, "sync-branch") {
+		t.Errorf("Expected log to contain skip message about sync-branch, got:\n%s", logOutput)
+	}
+
+	// Verify the log mentions the current branch
+	if !strings.Contains(logOutput, currentBranch) {
+		t.Errorf("Expected log to mention branch '%s', got:\n%s", currentBranch, logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// ============================================================================
+// Edge Case Tests (Scenarios 8-12 from test matrix)
+// ============================================================================
+
+// TestDaemonExportWorktreeDifferentBranch (scenario 8) tests that operations are
+// ALLOWED when working in a git worktree that is on a different branch than sync-branch.
+func TestDaemonExportWorktreeDifferentBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping on Windows due to worktree path issues")
+	}
+
+	// Clean up caches to avoid pollution from previous tests
+	git.ResetCaches()
+	beads.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Create a feature branch and a worktree for it
+	runGitCmd(t, tmpDir, "branch", "feature-branch")
+	worktreePath := filepath.Join(tmpDir, "feature-worktree")
+	runGitCmd(t, tmpDir, "worktree", "add", worktreePath, "feature-branch")
+
+	// Change to the worktree (which is on feature-branch)
+	t.Chdir(worktreePath)
+
+	// Set BEADS_SYNC_BRANCH to a DIFFERENT branch (main or master)
+	// This should ALLOW operations because feature-branch != main
+	t.Setenv(syncbranch.EnvVar, "main")
+
+	// Setup test store in the worktree
+	beadsDir := filepath.Join(worktreePath, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Set global dbPath so findJSONLPath() works
+	oldDBPath := dbPath
+	defer func() { dbPath = oldDBPath }()
+	dbPath = testDBPath
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create test issue and export to JSONL
+	issue := &types.Issue{
+		Title:     "Test worktree different branch",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("Failed to create issue: %v", err)
+	}
+
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := exportToJSONLWithStore(ctx, store, jsonlPath); err != nil {
+		t.Fatalf("Failed to export: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call shouldSkipDueToSameBranch directly - should return false (allow)
+	shouldSkip := shouldSkipDueToSameBranch(ctx, store, "test-operation", log)
+
+	if shouldSkip {
+		t.Error("Expected operation to be ALLOWED when worktree is on different branch than sync-branch")
+	}
+
+	logOutput := logBuf.String()
+	if strings.Contains(logOutput, "Skipping") {
+		t.Errorf("Expected no skip message, got:\n%s", logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestDaemonExportWorktreeSameBranch (scenario 9) tests that operations are
+// BLOCKED when working in a git worktree that is on the same branch as sync-branch.
+func TestDaemonExportWorktreeSameBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping on Windows due to worktree path issues")
+	}
+
+	// Clean up caches to avoid pollution from previous tests
+	git.ResetCaches()
+	beads.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Create a sync branch and a worktree for it
+	syncBranch := "beads-sync"
+	runGitCmd(t, tmpDir, "branch", syncBranch)
+	worktreePath := filepath.Join(tmpDir, "sync-worktree")
+	runGitCmd(t, tmpDir, "worktree", "add", worktreePath, syncBranch)
+
+	// Change to the worktree (which is on the sync branch)
+	t.Chdir(worktreePath)
+
+	// Set BEADS_SYNC_BRANCH to the SAME branch as the worktree
+	// This should BLOCK operations because beads-sync == beads-sync
+	t.Setenv(syncbranch.EnvVar, syncBranch)
+
+	// Setup test store in the worktree
+	beadsDir := filepath.Join(worktreePath, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Set global dbPath so findJSONLPath() works
+	oldDBPath := dbPath
+	defer func() { dbPath = oldDBPath }()
+	dbPath = testDBPath
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call shouldSkipDueToSameBranch directly - should return true (block)
+	shouldSkip := shouldSkipDueToSameBranch(ctx, store, "test-operation", log)
+
+	if !shouldSkip {
+		t.Error("Expected operation to be BLOCKED when worktree is on same branch as sync-branch")
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Skipping") || !strings.Contains(logOutput, syncBranch) {
+		t.Errorf("Expected skip message mentioning '%s', got:\n%s", syncBranch, logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestDaemonExportDynamicBranchSwitch (scenario 10) tests that the guard correctly
+// detects when a user switches to the sync branch after daemon starts.
+func TestDaemonExportDynamicBranchSwitch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up caches to avoid pollution from previous tests
+	git.ResetCaches()
+	beads.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Start on main branch
+	t.Chdir(tmpDir)
+
+	// Create a sync branch
+	syncBranch := "beads-sync"
+	runGitCmd(t, tmpDir, "branch", syncBranch)
+
+	// Set BEADS_SYNC_BRANCH
+	t.Setenv(syncbranch.EnvVar, syncBranch)
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Set global dbPath so findJSONLPath() works
+	oldDBPath := dbPath
+	defer func() { dbPath = oldDBPath }()
+	dbPath = testDBPath
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// First check on main branch - should allow
+	shouldSkip := shouldSkipDueToSameBranch(ctx, store, "test-operation", log)
+	if shouldSkip {
+		t.Error("Expected operation to be allowed on main branch")
+	}
+
+	// Reset caches to simulate fresh state after branch switch
+	git.ResetCaches()
+	logBuf.Reset()
+
+	// Switch to the sync branch (simulating user's `git checkout beads-sync`)
+	runGitCmd(t, tmpDir, "checkout", syncBranch)
+
+	// Reset caches again to ensure fresh branch detection
+	git.ResetCaches()
+
+	// Now check again - should block (dynamic detection)
+	shouldSkip = shouldSkipDueToSameBranch(ctx, store, "test-operation", log)
+	if !shouldSkip {
+		t.Error("Expected operation to be BLOCKED after switching to sync branch")
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Skipping") || !strings.Contains(logOutput, syncBranch) {
+		t.Errorf("Expected skip message after branch switch, got:\n%s", logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestDaemonExportAfterBranchChange (scenario 11) tests that operations are
+// ALLOWED after user switches away from the sync branch.
+func TestDaemonExportAfterBranchChange(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up caches to avoid pollution from previous tests
+	git.ResetCaches()
+	beads.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Start on main branch and create a sync branch
+	t.Chdir(tmpDir)
+	syncBranch := "beads-sync"
+	runGitCmd(t, tmpDir, "branch", syncBranch)
+
+	// Set BEADS_SYNC_BRANCH
+	t.Setenv(syncbranch.EnvVar, syncBranch)
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Set global dbPath so findJSONLPath() works
+	oldDBPath := dbPath
+	defer func() { dbPath = oldDBPath }()
+	dbPath = testDBPath
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Switch to sync branch (should block)
+	runGitCmd(t, tmpDir, "checkout", syncBranch)
+	git.ResetCaches()
+
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	shouldSkip := shouldSkipDueToSameBranch(ctx, store, "test-operation", log)
+	if !shouldSkip {
+		t.Error("Expected operation to be blocked on sync branch")
+	}
+
+	// Now switch back to main (should allow)
+	runGitCmd(t, tmpDir, "checkout", "main")
+	git.ResetCaches()
+	logBuf.Reset()
+
+	shouldSkip = shouldSkipDueToSameBranch(ctx, store, "test-operation", log)
+	if shouldSkip {
+		t.Error("Expected operation to be ALLOWED after switching away from sync branch")
+	}
+
+	logOutput := logBuf.String()
+	if strings.Contains(logOutput, "Skipping") {
+		t.Errorf("Expected no skip message after switching to main, got:\n%s", logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestDaemonExportConfigReload (scenario 12) tests that the guard correctly
+// detects when sync.branch config is changed via environment variable.
+// Note: We test via env var because syncbranch.Get() has a priority order:
+// 1. BEADS_SYNC_BRANCH env var (highest)
+// 2. config.yaml (may be polluted from other tests)
+// 3. database config (lowest)
+// Using env var ensures we're testing the actual reload behavior.
+func TestDaemonExportConfigReload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up caches to avoid pollution from previous tests
+	git.ResetCaches()
+	beads.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	t.Chdir(tmpDir)
+
+	// Get current branch name
+	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd.Dir = tmpDir
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get current branch: %v", err)
+	}
+	currentBranch := strings.TrimSpace(string(output))
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	// Set global dbPath so findJSONLPath() works
+	oldDBPath := dbPath
+	defer func() { dbPath = oldDBPath }()
+	dbPath = testDBPath
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Set sync.branch to a DIFFERENT branch via env var (safe-sync)
+	t.Setenv(syncbranch.EnvVar, "safe-sync")
+
+	// First check - should allow (main != safe-sync)
+	shouldSkip := shouldSkipDueToSameBranch(ctx, store, "test-operation", log)
+	if shouldSkip {
+		t.Error("Expected operation to be allowed when sync.branch is 'safe-sync'")
+	}
+
+	// Now change sync.branch to the current branch via env var (simulating config reload)
+	t.Setenv(syncbranch.EnvVar, currentBranch)
+	logBuf.Reset()
+
+	// Second check - should block (main == main)
+	shouldSkip = shouldSkipDueToSameBranch(ctx, store, "test-operation", log)
+	if !shouldSkip {
+		t.Error("Expected operation to be BLOCKED after sync.branch changed to current branch")
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Skipping") || !strings.Contains(logOutput, currentBranch) {
+		t.Errorf("Expected skip message after config change, got:\n%s", logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestDaemonStartupWarnsSameBranch tests that daemon startup logs a warning when
+// sync-branch == current-branch, but continues to start (warn only, don't block).
+// This is a one-time warning at startup (GH#1258 Phase 3).
+func TestDaemonStartupWarnsSameBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up git caches to avoid pollution from previous tests
+	git.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Change to temp directory first (so git commands work)
+	t.Chdir(tmpDir)
+
+	// Get current branch name
+	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd.Dir = tmpDir
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get current branch: %v", err)
+	}
+	currentBranch := strings.TrimSpace(string(output))
+
+	// Set BEADS_SYNC_BRANCH to the current branch (highest priority config)
+	// This is the misconfiguration case: sync-branch == current-branch
+	t.Setenv(syncbranch.EnvVar, currentBranch)
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call warnIfSyncBranchMisconfigured - this should log a warning
+	misconfigured := warnIfSyncBranchMisconfigured(ctx, store, log)
+
+	// Verify the function returns true (misconfigured)
+	if !misconfigured {
+		t.Error("Expected warnIfSyncBranchMisconfigured to return true")
+	}
+
+	// Verify the warning was logged
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "sync-branch misconfiguration detected") {
+		t.Errorf("Expected warning about sync-branch misconfiguration, got:\n%s", logOutput)
+	}
+
+	// Verify the log mentions the branch name
+	if !strings.Contains(logOutput, currentBranch) {
+		t.Errorf("Expected warning to mention branch '%s', got:\n%s", currentBranch, logOutput)
+	}
+
+	// Verify the log contains guidance about dedicated sync branch
+	if !strings.Contains(logOutput, "beads-sync") {
+		t.Errorf("Expected warning to suggest 'beads-sync', got:\n%s", logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestDaemonStartupNoWarningWhenDifferentBranch tests that daemon startup does NOT
+// log a warning when sync-branch is configured but different from current-branch.
+func TestDaemonStartupNoWarningWhenDifferentBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up git caches to avoid pollution from previous tests
+	git.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Change to temp directory first (so git commands work)
+	t.Chdir(tmpDir)
+
+	// Set BEADS_SYNC_BRANCH to a different branch (not current-branch)
+	t.Setenv(syncbranch.EnvVar, "beads-sync")
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call warnIfSyncBranchMisconfigured - this should NOT log a warning
+	misconfigured := warnIfSyncBranchMisconfigured(ctx, store, log)
+
+	// Verify the function returns false (not misconfigured)
+	if misconfigured {
+		t.Error("Expected warnIfSyncBranchMisconfigured to return false")
+	}
+
+	// Verify NO warning was logged
+	logOutput := logBuf.String()
+	if strings.Contains(logOutput, "misconfiguration") {
+		t.Errorf("Expected NO warning when sync-branch differs from current-branch, got:\n%s", logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
+}
+
+// TestDaemonStartupNoWarningWhenNoSyncBranch tests that daemon startup does NOT
+// log a warning when no sync-branch is configured.
+func TestDaemonStartupNoWarningWhenNoSyncBranch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Clean up git caches to avoid pollution from previous tests
+	git.ResetCaches()
+
+	tmpDir := t.TempDir()
+	initTestGitRepo(t, tmpDir)
+	initMainBranch(t, tmpDir)
+
+	// Change to temp directory first (so git commands work)
+	t.Chdir(tmpDir)
+
+	// Ensure no sync-branch is configured (unset env var)
+	t.Setenv(syncbranch.EnvVar, "")
+
+	// Setup test store
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads dir: %v", err)
+	}
+
+	testDBPath := filepath.Join(beadsDir, "test.db")
+	store, err := sqlite.New(context.Background(), testDBPath)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("Failed to set prefix: %v", err)
+	}
+
+	// Create logger that captures output
+	var logBuf strings.Builder
+	log := newTestLoggerWithWriter(&logBuf)
+
+	// Call warnIfSyncBranchMisconfigured - this should NOT log a warning
+	misconfigured := warnIfSyncBranchMisconfigured(ctx, store, log)
+
+	// Verify the function returns false (not misconfigured)
+	if misconfigured {
+		t.Error("Expected warnIfSyncBranchMisconfigured to return false when no sync-branch configured")
+	}
+
+	// Verify NO warning was logged
+	logOutput := logBuf.String()
+	if strings.Contains(logOutput, "misconfiguration") {
+		t.Errorf("Expected NO warning when no sync-branch configured, got:\n%s", logOutput)
+	}
+
+	// Clean up git caches
+	git.ResetCaches()
 }

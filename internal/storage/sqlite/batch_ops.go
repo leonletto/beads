@@ -7,18 +7,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // validateBatchIssues validates all issues in a batch and sets timestamps if not provided
-// Uses built-in statuses only for backward compatibility.
+// Uses built-in statuses and types only for backward compatibility.
 func validateBatchIssues(issues []*types.Issue) error {
-	return validateBatchIssuesWithCustomStatuses(issues, nil)
+	return validateBatchIssuesWithCustom(issues, nil, nil)
 }
 
-// validateBatchIssuesWithCustomStatuses validates all issues in a batch,
-// allowing custom statuses in addition to built-in ones.
-func validateBatchIssuesWithCustomStatuses(issues []*types.Issue, customStatuses []string) error {
+// validateBatchIssuesWithCustom validates all issues in a batch,
+// allowing custom statuses and types in addition to built-in ones.
+func validateBatchIssuesWithCustom(issues []*types.Issue, customStatuses, customTypes []string) error {
 	now := time.Now()
 	for i, issue := range issues {
 		if issue == nil {
@@ -54,7 +55,7 @@ func validateBatchIssuesWithCustomStatuses(issues []*types.Issue, customStatuses
 			issue.DeletedAt = &deletedAt
 		}
 
-		if err := issue.ValidateWithCustomStatuses(customStatuses); err != nil {
+		if err := issue.ValidateWithCustom(customStatuses, customTypes); err != nil {
 			return fmt.Errorf("validation failed for issue %d: %w", i, err)
 		}
 	}
@@ -87,9 +88,10 @@ func (s *SQLiteStorage) generateBatchIDs(ctx context.Context, conn *sql.Conn, is
 	return nil
 }
 
-// bulkInsertIssues delegates to insertIssues helper
+// bulkInsertIssues delegates to insertIssuesStrict helper for fresh issue creation.
+// GH#956: Using strict insert prevents FK constraint errors from silent INSERT OR IGNORE failures.
 func bulkInsertIssues(ctx context.Context, conn *sql.Conn, issues []*types.Issue) error {
-	return insertIssues(ctx, conn, issues)
+	return insertIssuesStrict(ctx, conn, issues)
 }
 
 // bulkRecordEvents delegates to recordCreatedEvents helper
@@ -230,11 +232,9 @@ func (s *SQLiteStorage) CreateIssues(ctx context.Context, issues []*types.Issue,
 	return s.CreateIssuesWithOptions(ctx, issues, actor, OrphanResurrect)
 }
 
-// BatchCreateOptions contains options for batch issue creation
-type BatchCreateOptions struct {
-	OrphanHandling       OrphanHandling // How to handle missing parent issues
-	SkipPrefixValidation bool           // Skip prefix validation for existing IDs (used during import)
-}
+// BatchCreateOptions is an alias for storage.BatchCreateOptions for backward compatibility.
+// Deprecated: Use storage.BatchCreateOptions directly.
+type BatchCreateOptions = storage.BatchCreateOptions
 
 // CreateIssuesWithOptions creates multiple issues with configurable orphan handling
 func (s *SQLiteStorage) CreateIssuesWithOptions(ctx context.Context, issues []*types.Issue, actor string, orphanHandling OrphanHandling) error {
@@ -250,14 +250,18 @@ func (s *SQLiteStorage) CreateIssuesWithFullOptions(ctx context.Context, issues 
 		return nil
 	}
 
-	// Fetch custom statuses for validation
+	// Fetch custom statuses and types for validation
 	customStatuses, err := s.GetCustomStatuses(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get custom statuses: %w", err)
 	}
+	customTypes, err := s.GetCustomTypes(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get custom types: %w", err)
+	}
 
-	// Phase 1: Validate all issues first (fail-fast, with custom status support)
-	if err := validateBatchIssuesWithCustomStatuses(issues, customStatuses); err != nil {
+	// Phase 1: Validate all issues first (fail-fast, with custom status and type support)
+	if err := validateBatchIssuesWithCustom(issues, customStatuses, customTypes); err != nil {
 		return err
 	}
 
@@ -268,8 +272,9 @@ func (s *SQLiteStorage) CreateIssuesWithFullOptions(ctx context.Context, issues 
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Use retry logic with exponential backoff to handle SQLITE_BUSY under concurrent load
-	if err := beginImmediateWithRetry(ctx, conn, 5, 10*time.Millisecond); err != nil {
+	// Start IMMEDIATE transaction to acquire write lock early.
+	// The connection's busy_timeout pragma (30s) handles retries if locked.
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("failed to begin immediate transaction: %w", err)
 	}
 

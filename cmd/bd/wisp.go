@@ -211,9 +211,14 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 		}
 
 		// Load the proto
+		// Note: GetIssue returns (nil, nil) for not-found, so check both
 		protoIssue, err := store.GetIssue(ctx, protoID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading proto %s: %v\n", protoID, err)
+			os.Exit(1)
+		}
+		if protoIssue == nil {
+			fmt.Fprintf(os.Stderr, "Error: proto not found: %s\n", protoID)
 			os.Exit(1)
 		}
 		if !isProtoIssue(protoIssue) {
@@ -257,8 +262,8 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 	}
 
 	// Spawn as ephemeral in main database (Ephemeral=true, skips JSONL export)
-	// Use "eph" prefix for distinct visual recognition
-	result, err := spawnMolecule(ctx, store, subgraph, vars, "", actor, true, "eph")
+	// Use wisp prefix for distinct visual recognition (see types.IDPrefixWisp)
+	result, err := spawnMolecule(ctx, store, subgraph, vars, "", actor, true, types.IDPrefixWisp)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating wisp: %v\n", err)
 		os.Exit(1)
@@ -297,7 +302,8 @@ func isProtoIssue(issue *types.Issue) bool {
 // resolvePartialIDDirect resolves a partial ID directly from store
 func resolvePartialIDDirect(ctx context.Context, partial string) (string, error) {
 	// Try direct lookup first
-	if issue, err := store.GetIssue(ctx, partial); err == nil {
+	// Note: GetIssue returns (nil, nil) for not-found, so check both
+	if issue, err := store.GetIssue(ctx, partial); err == nil && issue != nil {
 		return issue.ID, nil
 	}
 	// Search by prefix
