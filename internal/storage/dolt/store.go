@@ -68,6 +68,9 @@ func isTestDatabaseName(name string) bool {
 	return false
 }
 
+// Compile-time interface check.
+var _ storage.DoltStorage = (*DoltStore)(nil)
+
 // DoltStore implements the Storage interface using Dolt
 type DoltStore struct {
 	db            *sql.DB
@@ -681,6 +684,14 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 			_ = db.Close()
 			return nil, verifyErr
 		}
+	}
+
+	if isLocalHost(cfg.ServerHost) {
+		beadsDir := cfg.BeadsDir
+		if beadsDir == "" && cfg.Path != "" {
+			beadsDir = filepath.Dir(cfg.Path)
+		}
+		_ = doltserver.EnsurePortFile(beadsDir, cfg.ServerPort)
 	}
 
 	// All writers operate on main — transaction isolation via RunInTransaction
@@ -1624,14 +1635,8 @@ func (s *DoltStore) Log(ctx context.Context, limit int) ([]CommitInfo, error) {
 	return commits, rows.Err()
 }
 
-// CommitInfo represents a Dolt commit
-type CommitInfo struct {
-	Hash    string
-	Author  string
-	Email   string
-	Date    time.Time
-	Message string
-}
+// CommitInfo is an alias for storage.CommitInfo.
+type CommitInfo = storage.CommitInfo
 
 // HistoryEntry represents a row from dolt_history_* table
 type HistoryEntry struct {
@@ -1693,14 +1698,8 @@ func (s *DoltStore) Status(ctx context.Context) (*DoltStatus, error) {
 	return status, rows.Err()
 }
 
-// DoltStatus represents the current repository status
-type DoltStatus struct {
-	Staged   []StatusEntry
-	Unstaged []StatusEntry
-}
+// DoltStatus is an alias for storage.Status.
+type DoltStatus = storage.Status
 
-// StatusEntry represents a changed table
-type StatusEntry struct {
-	Table  string
-	Status string // "new", "modified", "deleted"
-}
+// StatusEntry is an alias for storage.StatusEntry.
+type StatusEntry = storage.StatusEntry

@@ -330,7 +330,7 @@ var listCmd = &cobra.Command{
 		if flatFormat {
 			treeFormat = false
 		}
-		prettyFormat = prettyFormat || treeFormat // --tree is alias for --pretty
+		prettyFormat = (prettyFormat || treeFormat) && !jsonOutput // --tree is alias for --pretty; JSON wins
 		watchMode, _ := cmd.Flags().GetBool("watch")
 
 		// Pager control (bd-jdz3)
@@ -564,9 +564,12 @@ var listCmd = &cobra.Command{
 		if pinnedFlag {
 			pinned := true
 			filter.Pinned = &pinned
-		} else if noPinnedFlag || (status != "pinned" && !allFlag) {
+		} else if noPinnedFlag || (status != "pinned" && status != "hooked" && !allFlag) {
 			// Exclude pinned beads by default — they are permanent references,
 			// not actionable work items. Use --pinned or --all to see them. (bd-uhcg)
+			// Also skip exclusion for --status=hooked: beads transitioning from
+			// pinned to hooked retain the legacy pinned=1 column, and excluding
+			// them breaks gt hook status detection (bd-pr-sheriff bug).
 			pinned := false
 			filter.Pinned = &pinned
 		}
@@ -740,7 +743,7 @@ var listCmd = &cobra.Command{
 		}
 
 		// Handle pretty format (GH#654)
-		// JSON output takes priority over pretty/tree format (bd-list-json-fix)
+		// JSON output takes priority over pretty/tree format (bd-list-json-fix, bd-03r)
 		if prettyFormat && !jsonOutput {
 			// Special handling for --tree --parent combination (hierarchical descendants)
 			if parentID != "" {

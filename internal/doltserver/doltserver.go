@@ -230,6 +230,19 @@ func writePortFile(beadsDir string, port int) error {
 	return os.WriteFile(portPath(beadsDir), []byte(strconv.Itoa(port)), 0600)
 }
 
+// EnsurePortFile makes the repo-local port file match the connected server port.
+// This is a best-effort repair path for upgraded repos that are missing
+// .beads/dolt-server.port even though commands can still connect.
+func EnsurePortFile(beadsDir string, port int) error {
+	if beadsDir == "" || port <= 0 {
+		return nil
+	}
+	if readPortFile(beadsDir) == port {
+		return nil
+	}
+	return writePortFile(beadsDir, port)
+}
+
 // DefaultConfig returns config with sensible defaults.
 // Priority: env var > metadata.json > config.yaml / global config > port file > DerivePort.
 //
@@ -352,6 +365,7 @@ func EnsureRunning(beadsDir string) (int, error) {
 		return 0, err
 	}
 	if state.Running {
+		_ = EnsurePortFile(serverDir, state.Port)
 		// Touch activity file so idle monitor knows we're active
 		touchActivity(serverDir)
 		return state.Port, nil
@@ -465,7 +479,7 @@ func Start(beadsDir string) (*State, error) {
 	}
 
 	// Start dolt sql-server
-	cmd := exec.Command(doltBin, "sql-server",
+	cmd := exec.Command(doltBin, "sql-server", //nolint:gosec // G702: doltBin is resolved from PATH, not user input
 		"-H", cfg.Host,
 		"-P", strconv.Itoa(actualPort),
 	)
@@ -689,7 +703,7 @@ func waitForReady(host string, port int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond) //nolint:gosec // G704: addr is built from internal host+port, not user input
 		if err == nil {
 			_ = conn.Close()
 			return nil
@@ -981,6 +995,12 @@ func RunIdleMonitor(beadsDir string, idleTimeout time.Duration) {
 	// haven't performed an idle shutdown (or the server was restarted since).
 	var idleShutdownAt time.Time
 
+	// Remember the port the server was using before we stopped it, so we
+	// can restore the port file before calling Start(). Without this,
+	// stopServerProcess removes the port file, and Start() may fall back
+	// to a hash-derived port that differs from the original (bd-xvg).
+	var lastKnownPort int
+
 	for {
 		time.Sleep(MonitorCheckInterval)
 
@@ -994,6 +1014,7 @@ func RunIdleMonitor(beadsDir string, idleTimeout time.Duration) {
 
 		if state.Running {
 			idleShutdownAt = time.Time{} // server is up, clear idle-shutdown tracking
+			lastKnownPort = state.Port   // track port while server is up
 
 			// Server is running — check if idle
 			if !lastActivity.IsZero() && idleDuration > idleTimeout {
@@ -1008,7 +1029,11 @@ func RunIdleMonitor(beadsDir string, idleTimeout time.Duration) {
 				// We stopped it for idle timeout. Check for new activity
 				// (e.g. EnsureRunning touched the activity file).
 				if !lastActivity.IsZero() && lastActivity.After(idleShutdownAt) {
-					// New activity since we stopped — restart
+					// New activity since we stopped — restart on the same port.
+					// Restore port file so Start()/DefaultConfig() picks it up.
+					if lastKnownPort > 0 {
+						_ = writePortFile(beadsDir, lastKnownPort)
+					}
 					_, _ = Start(beadsDir)
 					idleShutdownAt = time.Time{}
 					continue
@@ -1023,13 +1048,16 @@ func RunIdleMonitor(beadsDir string, idleTimeout time.Duration) {
 				continue
 			}
 
-			// Server is down but we didn't stop it (crash or external stop)
+			// Server is down but we didn't stop it (crash or external stop).
 			if lastActivity.IsZero() || idleDuration > idleTimeout {
 				// No recent activity — just exit
 				_ = os.Remove(monitorPidPath(beadsDir))
 				return
 			}
-			// Recent activity but server crashed — restart
+			// Recent activity but server crashed — restart on the same port.
+			if lastKnownPort > 0 {
+				_ = writePortFile(beadsDir, lastKnownPort)
+			}
 			_, _ = Start(beadsDir)
 		}
 	}
